@@ -72,7 +72,7 @@ From the repo root:
 ```powershell
 .\scripts\download-libs.ps1
 .\scripts\download-assets.ps1
-java -jar .\staging\cache\tools\fabric-installer.jar client -dir .\staging\cache\gameDir -mcversion 1.21.11 -loader 0.19.2 -launcher win32
+java -jar .\staging\cache\tools\fabric-installer.jar client -dir .\staging\cache\gameDir -mcversion 1.21.11 -loader 0.19.2 -launcher win32 -noprofile
 ```
 
 Make sure these paths exist after setup:
