@@ -4,7 +4,8 @@ param(
     [string]$McVersion,
     [string]$FabricLoader,
     [string]$AssetIndex,
-    [switch]$KeepStaging
+    [switch]$KeepStaging,
+    [switch]$SkipStopAppProcesses
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,6 +37,206 @@ $tools = Resolve-VSTools
 $sdk = Resolve-WindowsSdk
 $sdkRoot = $sdk.Root
 $sdkVer = $sdk.Version
+
+function Stop-BuildBlockingProcesses {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PackageName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PackageContentPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputPath,
+
+        [string[]]$LockPaths = @()
+    )
+
+    $rootMatch = $RootPath.Replace('\', '\\')
+    $pkgMatch = $PackageContentPath.Replace('\', '\\')
+    $outMatch = $OutputPath.Replace('\', '\\')
+
+    function Get-RestartManagerLockingProcessIds {
+        param(
+            [Parameter(Mandatory = $true)]
+            [string[]]$Paths
+        )
+
+        $existingPaths = @($Paths | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | ForEach-Object { (Resolve-Path -LiteralPath $_).Path })
+        if (-not $existingPaths) { return @() }
+
+        if (-not ("BuildRestartManager" -as [type])) {
+            Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class BuildRestartManager
+{
+    const int CCH_RM_SESSION_KEY = 32;
+    const int ERROR_MORE_DATA = 234;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct FILETIME
+    {
+        public uint dwLowDateTime;
+        public uint dwHighDateTime;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct RM_UNIQUE_PROCESS
+    {
+        public int dwProcessId;
+        public FILETIME ProcessStartTime;
+    }
+
+    enum RM_APP_TYPE
+    {
+        RmUnknownApp = 0,
+        RmMainWindow = 1,
+        RmOtherWindow = 2,
+        RmService = 3,
+        RmExplorer = 4,
+        RmConsole = 5,
+        RmCritical = 1000
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct RM_PROCESS_INFO
+    {
+        public RM_UNIQUE_PROCESS Process;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+        public string strAppName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        public string strServiceShortName;
+        public RM_APP_TYPE ApplicationType;
+        public uint AppStatus;
+        public uint TSSessionId;
+        [MarshalAs(UnmanagedType.Bool)]
+        public bool bRestartable;
+    }
+
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, StringBuilder strSessionKey);
+
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    static extern int RmRegisterResources(uint pSessionHandle, uint nFiles, string[] rgsFilenames, uint nApplications, IntPtr rgApplications, uint nServices, string[] rgsServiceNames);
+
+    [DllImport("rstrtmgr.dll")]
+    static extern int RmGetList(uint dwSessionHandle, out uint pnProcInfoNeeded, ref uint pnProcInfo, [In, Out] RM_PROCESS_INFO[] rgAffectedApps, ref uint lpdwRebootReasons);
+
+    [DllImport("rstrtmgr.dll")]
+    static extern int RmEndSession(uint pSessionHandle);
+
+    public static int[] GetLockingProcessIds(string[] paths)
+    {
+        uint handle;
+        var key = new StringBuilder(CCH_RM_SESSION_KEY + 1);
+        int result = RmStartSession(out handle, 0, key);
+        if (result != 0) return new int[0];
+
+        try
+        {
+            result = RmRegisterResources(handle, (uint)paths.Length, paths, 0, IntPtr.Zero, 0, null);
+            if (result != 0) return new int[0];
+
+            uint needed;
+            uint count = 0;
+            uint reasons = 0;
+            result = RmGetList(handle, out needed, ref count, null, ref reasons);
+            if (result != ERROR_MORE_DATA || needed == 0) return new int[0];
+
+            count = needed;
+            var processes = new RM_PROCESS_INFO[count];
+            result = RmGetList(handle, out needed, ref count, processes, ref reasons);
+            if (result != 0) return new int[0];
+
+            var ids = new List<int>();
+            for (int i = 0; i < count; i++)
+            {
+                int id = processes[i].Process.dwProcessId;
+                if (!ids.Contains(id)) ids.Add(id);
+            }
+            return ids.ToArray();
+        }
+        finally
+        {
+            RmEndSession(handle);
+        }
+    }
+}
+"@
+        }
+
+        return [BuildRestartManager]::GetLockingProcessIds($existingPaths)
+    }
+
+    $allProcesses = @(Get-CimInstance Win32_Process)
+    $lockProcessIds = @(Get-RestartManagerLockingProcessIds -Paths $LockPaths | Where-Object { $_ -and $_ -ne $PID })
+
+    $matches = $allProcesses |
+        Where-Object {
+            $name = $_.Name
+            $path = [string]$_.ExecutablePath
+            $cmd = [string]$_.CommandLine
+            $matched = $false
+
+            if ($_.ProcessId -ne $PID) {
+                if ($lockProcessIds -contains $_.ProcessId) { $matched = $true }
+                if ($name -ieq "MC.Xbox.exe") { $matched = $true }
+                if ($PackageName -and ($path -like "*$PackageName*" -or $cmd -like "*$PackageName*")) { $matched = $true }
+
+                $isPackagingTool = $name -ieq "makeappx.exe" -or $name -ieq "signtool.exe"
+                if ($isPackagingTool -and (
+                    $cmd -like "*$RootPath*" -or
+                    $cmd -like "*$rootMatch*" -or
+                    $cmd -like "*$PackageContentPath*" -or
+                    $cmd -like "*$pkgMatch*" -or
+                    $cmd -like "*$OutputPath*" -or
+                    $cmd -like "*$outMatch*")) {
+                    $matched = $true
+                }
+            }
+
+            $matched
+        }
+
+    if (-not $matches) {
+        Write-Host "No running app/package processes found."
+        return
+    }
+
+    Write-Host "Stopping running app/package processes..."
+    $restartExplorer = $false
+    foreach ($proc in $matches) {
+        Write-Host "  Stop PID $($proc.ProcessId) $($proc.Name)"
+        if ($proc.Name -ieq "explorer.exe") {
+            $restartExplorer = $true
+        }
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+
+    Start-Sleep -Milliseconds 500
+    if ($restartExplorer) {
+        Start-Process explorer.exe
+    }
+}
+
+if (-not $SkipStopAppProcesses) {
+    $manifestPath = Join-Path $root "MC.Xbox\Package.appxmanifest"
+    [xml]$manifest = Get-Content $manifestPath
+    $packageName = $manifest.Package.Identity.Name
+    Stop-BuildBlockingProcesses `
+        -PackageName $packageName `
+        -RootPath $root `
+        -PackageContentPath $pkg `
+        -OutputPath (Join-Path $outDir $ProjectConfig.AppxFileName) `
+        -LockPaths @((Join-Path $outDir $ProjectConfig.AppxFileName))
+}
 
 New-Item -ItemType Directory -Force -Path $buildDir, $outDir, $certDir, $mcBuildDir, $glfwBuildDir | Out-Null
 
@@ -218,6 +419,15 @@ if (-not $makeappx) {
 if (-not $makeappx) { throw "makeappx.exe not found. Add Windows SDK bin to PATH." }
 $signtool = Get-ChildItem "${sdkRoot}bin\$sdkVer\x64\signtool.exe","${sdkRoot}bin\10.0.26100.0\x64\signtool.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
 if (-not $signtool) { $signtool = "signtool" }
+
+if (-not $SkipStopAppProcesses) {
+    Stop-BuildBlockingProcesses `
+        -PackageName $packageName `
+        -RootPath $root `
+        -PackageContentPath $pkg `
+        -OutputPath $appx `
+        -LockPaths @($appx)
+}
 
 & $makeappx pack /d $pkg /p $appx /overwrite
 if ($LASTEXITCODE -ne 0) { throw "MakeAppx failed" }

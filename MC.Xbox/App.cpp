@@ -191,7 +191,14 @@ static bool SeedLocalRuntime(const std::wstring& packageDir, const std::wstring&
 
     EnsureDirectoryTree(localDir);
     WriteLogF(L"Seeding LocalState runtime from %s", packageDir.c_str());
-    CopyDirectoryContentsIfNeeded(packageDir + L"\\game", localDir + L"\\game");
+    const std::wstring runtimeDir = packageDir + L"\\runtime";
+    const std::wstring legacyGameDir = packageDir + L"\\game";
+    const std::wstring gameSeedDir =
+        GetFileAttributesW(runtimeDir.c_str()) != INVALID_FILE_ATTRIBUTES ? runtimeDir : legacyGameDir;
+    WriteLogF(L"Game seed source: %s", gameSeedDir.c_str());
+
+    CopyDirectoryContentsIfNeeded(gameSeedDir, localDir + L"\\game");
+    CopyDirectoryContentsIfNeeded(gameSeedDir + L"\\bundled-mods", localDir + L"\\game\\mods");
     CopyDirectoryContentsIfNeeded(packageDir + L"\\assets", localDir + L"\\assets");
     CopyDirectoryContentsIfNeeded(packageDir + L"\\natives", localDir + L"\\natives");
     CopyDirectoryContentsIfNeeded(packageDir + L"\\jre", localDir + L"\\jre");
