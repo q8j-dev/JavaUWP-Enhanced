@@ -29,3 +29,17 @@ Pop-Location
 
 Write-Host "Done - fabric-loader-$loaderVersion.jar patched"
 Write-Host "Class injected: $classFile"
+Write-Host "Stripping JAR signature..."
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$archive = [System.IO.Compression.ZipFile]::Open($loader, 'Update')
+try {
+    $sigs = @($archive.Entries | Where-Object {
+        $_.FullName -match '^META-INF/.+\.(SF|RSA|DSA|EC)$'
+    })
+    foreach ($entry in $sigs) {
+        Write-Host "  removing $($entry.FullName)"
+        $entry.Delete()
+    }
+} finally {
+    $archive.Dispose()
+}
