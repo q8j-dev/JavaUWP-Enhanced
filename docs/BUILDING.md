@@ -22,7 +22,7 @@ output\MC_Java_1.0.0.0.appx
 Install Pillow:
 
 ```powershell
-py -m pip install pillow
+python -m pip install pillow
 ```
 
 ## Versions
