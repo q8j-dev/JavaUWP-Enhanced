@@ -1,22 +1,51 @@
-# generate-assets.py - Generate placeholder UWP tile images for MC Java port
+# generate-assets.py - Build UWP tile images from the project icon.
 from PIL import Image, ImageDraw
-import sys
 import os
+import sys
 
 pkg = sys.argv[1] if len(sys.argv) > 1 else "PackageContent"
+repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+source_icon = sys.argv[2] if len(sys.argv) > 2 else os.path.join(repo, "MC.Xbox", "Assets", "Java_UWP_Icon.png")
 assets = os.path.join(pkg, "Assets")
 os.makedirs(assets, exist_ok=True)
 
-def make(path, w, h, color=(29, 29, 29), text="MC"):
-    img = Image.new("RGBA", (w, h), color)
-    d = ImageDraw.Draw(img)
-    d.rectangle([0, 0, w-1, h-1], outline=(100, 200, 100), width=4)
-    d.text((w//2 - 10, h//2 - 8), text, fill=(100, 200, 100))
+if not os.path.isfile(source_icon):
+    raise FileNotFoundError(f"Icon source not found: {source_icon}")
+
+
+def load_icon():
+    return Image.open(source_icon).convert("RGBA")
+
+
+def resize_cover(img, width, height):
+    scale = max(width / img.width, height / img.height)
+    resized = img.resize((round(img.width * scale), round(img.height * scale)), Image.Resampling.LANCZOS)
+    left = (resized.width - width) // 2
+    top = (resized.height - height) // 2
+    return resized.crop((left, top, left + width, top + height))
+
+
+def resize_contain(img, width, height, background=(0, 0, 0, 0), fill=0.72):
+    canvas = Image.new("RGBA", (width, height), background)
+    target = min(width, height) * fill
+    scale = min(target / img.width, target / img.height)
+    resized = img.resize((round(img.width * scale), round(img.height * scale)), Image.Resampling.LANCZOS)
+    canvas.alpha_composite(resized, ((width - resized.width) // 2, (height - resized.height) // 2))
+    return canvas
+
+
+def save(path, img):
     img.save(path)
     print(f"Created {path}")
 
-make(os.path.join(assets, "StoreLogo.png"),         50,  50)
-make(os.path.join(assets, "Square44x44Logo.png"),   44,  44)
-make(os.path.join(assets, "Square150x150Logo.png"), 150, 150)
-make(os.path.join(assets, "Wide310x150Logo.png"),   310, 150)
-make(os.path.join(assets, "SplashScreen.png"),      620, 300, text="Java Port")
+
+icon = load_icon()
+save(os.path.join(assets, "StoreLogo.png"), resize_cover(icon, 50, 50))
+save(os.path.join(assets, "Square44x44Logo.png"), resize_cover(icon, 44, 44))
+save(os.path.join(assets, "Square150x150Logo.png"), resize_cover(icon, 150, 150))
+save(os.path.join(assets, "Wide310x150Logo.png"), resize_contain(icon, 310, 150))
+
+splash = Image.new("RGBA", (620, 300), (0, 0, 0, 255))
+draw = ImageDraw.Draw(splash)
+draw.text((260, 140), "Java Port", fill=(255, 255, 255, 255))
+save(os.path.join(assets, "SplashScreen.png"), splash)
