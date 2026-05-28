@@ -249,7 +249,9 @@ static bool IsLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std:
     const bool hasJre =
         GetFileAttributesW((localDir + L"\\jre\\bin\\server\\jvm.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
         GetFileAttributesW((localDir + L"\\jre\\conf\\security\\java.security").c_str()) != INVALID_FILE_ATTRIBUTES;
-    return hasGame && hasAssets && hasNatives && hasGraphics && hasJre;
+    const bool hasJavaSecurityPatch =
+        GetFileAttributesW((localDir + L"\\java-base-security-realpath.jar").c_str()) != INVALID_FILE_ATTRIBUTES;
+    return hasGame && hasAssets && hasNatives && hasGraphics && hasJre && hasJavaSecurityPatch;
 }
 
 static void MarkLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std::wstring& localDir) {
@@ -346,6 +348,7 @@ static bool SeedLocalRuntime(
         progress(L"Finalizing runtime", L"Writing launch configuration", 0.96f);
     }
     CopyFileIfNeeded(packageDir + L"\\xbox_security.properties", localDir + L"\\xbox_security.properties");
+    CopyFileIfNeeded(packageDir + L"\\java-base-security-realpath.jar", localDir + L"\\java-base-security-realpath.jar");
     if (progress) {
         progress(L"Runtime ready", L"Starting Minecraft", 1.0f);
     }
@@ -2118,6 +2121,13 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     vmOptionStorage.push_back("-Xms512M");
     vmOptionStorage.push_back("--enable-native-access=ALL-UNNAMED");
     vmOptionStorage.push_back("--add-opens=jdk.zipfs/jdk.nio.zipfs=ALL-UNNAMED");
+    const std::wstring javaSecurityPatch = exeDir + L"\\java-base-security-realpath.jar";
+    if (GetFileAttributesW(javaSecurityPatch.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        vmOptionStorage.push_back("--patch-module=java.base=" + w2a(fwd(javaSecurityPatch)));
+        WriteLogF(L"Java security realpath patch enabled: %s", javaSecurityPatch.c_str());
+    } else {
+        WriteLogF(L"Java security realpath patch missing: %s", javaSecurityPatch.c_str());
+    }
     vmOptionStorage.push_back("-Djava.home=" + w2a(fwd(jreDir)));
     vmOptionStorage.push_back("-Djava.security.properties==" + w2a(fwd(jreDir + L"\\conf\\security\\xbox.properties")));
     vmOptionStorage.push_back("-Djava.security.egd=file:/dev/./urandom");

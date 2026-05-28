@@ -432,6 +432,45 @@ Copy-Item $xboxSecurityProperties (Join-Path $pkg "xbox_security.properties") -F
 Copy-Item $xboxSecurityProperties (Join-Path $pkg "jre\conf\security\xbox.properties") -Force
 Copy-Item $xboxSecurityProperties (Join-Path $pkg "jre\conf\security\java.security") -Force
 
+Write-Host "Building Java security realpath patch..."
+$javacExe = Join-Path $jreSrc "bin\javac.exe"
+if (-not (Test-Path $javacExe)) { throw "javac.exe not found at $javacExe; Java security patch requires a JDK, not a JRE." }
+$srcZip = Join-Path $jreSrc "lib\src.zip"
+if (-not (Test-Path $srcZip)) { throw "JDK source archive not found at $srcZip; Java security patch cannot be generated." }
+$javaSecurityPatchDir = Join-Path $buildDir "java_security_realpath_patch"
+$javaSecurityPatchSrcDir = Join-Path $javaSecurityPatchDir "src"
+$javaSecurityPatchClassesDir = Join-Path $javaSecurityPatchDir "classes"
+$javaSecurityPatchJar = Join-Path $pkg "java-base-security-realpath.jar"
+Remove-Item -Recurse -Force $javaSecurityPatchDir -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path (Join-Path $javaSecurityPatchSrcDir "java\security"), $javaSecurityPatchClassesDir | Out-Null
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$srcArchive = [System.IO.Compression.ZipFile]::OpenRead($srcZip)
+try {
+    $securityEntry = $srcArchive.Entries | Where-Object { $_.FullName -eq "java.base/java/security/Security.java" } | Select-Object -First 1
+    if (-not $securityEntry) { throw "Security.java not found inside $srcZip" }
+    $reader = [System.IO.StreamReader]::new($securityEntry.Open())
+    try {
+        $securitySource = $reader.ReadToEnd()
+    } finally {
+        $reader.Dispose()
+    }
+} finally {
+    $srcArchive.Dispose()
+}
+$oldSecurityLine = "path = path.toRealPath();"
+$newSecurityLine = "try { path = path.toRealPath(); } catch (IOException realPathFailure) { path = path.toAbsolutePath(); }"
+if (-not $securitySource.Contains($oldSecurityLine)) { throw "Security.java patch target not found." }
+$securitySource = $securitySource.Replace($oldSecurityLine, $newSecurityLine)
+$securitySourcePath = Join-Path $javaSecurityPatchSrcDir "java\security\Security.java"
+[System.IO.File]::WriteAllText($securitySourcePath, $securitySource)
+& $javacExe --patch-module "java.base=$javaSecurityPatchSrcDir" -d $javaSecurityPatchClassesDir $securitySourcePath
+if ($LASTEXITCODE -ne 0) { throw "Java security patch compile failed" }
+Push-Location $javaSecurityPatchClassesDir
+& $jarExe cf $javaSecurityPatchJar .
+Pop-Location
+if ($LASTEXITCODE -ne 0) { throw "Java security patch jar creation failed" }
+Write-Host "Java security patch: $javaSecurityPatchJar"
+
 Write-Host "Generating UWP tile assets..."
 & $pythonExe (Join-Path $root "scripts\generate-assets.py") $pkg
 if ($LASTEXITCODE -ne 0) { throw "Asset generation failed" }
