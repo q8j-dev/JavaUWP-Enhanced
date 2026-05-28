@@ -245,7 +245,10 @@ static bool IsLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std:
     const bool hasNatives = GetFileAttributesW((localDir + L"\\natives").c_str()) != INVALID_FILE_ATTRIBUTES;
     const bool hasGraphics = GetFileAttributesW((localDir + L"\\graphics").c_str()) != INVALID_FILE_ATTRIBUTES ||
         GetFileAttributesW((localDir + L"\\natives\\opengl32.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
-    return hasGame && hasAssets && hasNatives && hasGraphics;
+    const bool hasJre =
+        GetFileAttributesW((localDir + L"\\jre\\bin\\server\\jvm.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW((localDir + L"\\jre\\conf\\security\\java.security").c_str()) != INVALID_FILE_ATTRIBUTES;
+    return hasGame && hasAssets && hasNatives && hasGraphics && hasJre;
 }
 
 static void MarkLocalRuntimeSeedCurrent(const std::wstring& packageDir, const std::wstring& localDir) {
@@ -318,6 +321,10 @@ static bool SeedLocalRuntime(
     }
     CopyDirectoryContentsIfNeeded(packageDir + L"\\assets", localDir + L"\\assets");
     if (progress) {
+        progress(L"Copying Java runtime", L"Preparing JVM files", 0.68f);
+    }
+    CopyDirectoryContentsIfNeeded(packageDir + L"\\jre", localDir + L"\\jre");
+    if (progress) {
         progress(L"Copying native libraries", L"Preparing graphics and input runtime", 0.84f);
     }
     CopyDirectoryContentsIfNeeded(packageDir + L"\\natives", localDir + L"\\natives");
@@ -326,6 +333,9 @@ static bool SeedLocalRuntime(
         progress(L"Finalizing runtime", L"Writing launch configuration", 0.96f);
     }
     CopyFileIfNeeded(packageDir + L"\\xbox_security.properties", localDir + L"\\xbox_security.properties");
+    CopyFileIfNeeded(
+        packageDir + L"\\xbox_security.properties",
+        localDir + L"\\jre\\conf\\security\\xbox.properties");
     if (progress) {
         progress(L"Runtime ready", L"Starting Minecraft", 1.0f);
     }
@@ -2397,14 +2407,12 @@ public:
             WriteLog(L"LocalState runtime seed is current; skipping copy");
         }
 
-        // Keep java.home under the installed package. Java security startup calls
-        // toRealPath() on conf\security\java.security, which fails from LocalState
-        // on the Xbox app container.
+        const std::wstring localJreDir = exeDir + L"\\jre";
         const std::wstring packageJreDir = packageDir + L"\\jre";
         const std::wstring jreDir =
-            (exeDir != packageDir && GetFileAttributesW((packageJreDir + L"\\bin\\java.exe").c_str()) != INVALID_FILE_ATTRIBUTES)
-                ? packageJreDir
-                : exeDir + L"\\jre";
+            GetFileAttributesW((localJreDir + L"\\bin\\java.exe").c_str()) != INVALID_FILE_ATTRIBUTES
+                ? localJreDir
+                : packageJreDir;
         const std::wstring gameDir = exeDir + L"\\game";
         const std::wstring javaExe = jreDir + L"\\bin\\java.exe";
         const std::wstring assetsDir = exeDir + L"\\assets";
