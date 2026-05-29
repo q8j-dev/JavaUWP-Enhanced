@@ -25,6 +25,7 @@
 #include <cctype>
 #include <cwctype>
 #include <functional>
+#include <new>
 #include <cmath>
 #include <d2d1_1.h>
 #include <dwrite.h>
@@ -77,6 +78,9 @@ static ComPtr<CoreWindowVisibilityHandler> g_coreWindowVisibilityHandler;
 static EventRegistrationToken g_coreWindowClosedToken = {};
 static EventRegistrationToken g_coreWindowVisibilityToken = {};
 static bool g_coreWindowLifecycleHooksInstalled = false;
+static volatile LONG g_logTailerRunning = 0;
+static HANDLE g_logTailerThreads[8] = {};
+static int g_logTailerThreadCount = 0;
 static constexpr wchar_t kEGLNativeWindowTypeProperty[] = L"EGLNativeWindowTypeProperty";
 static constexpr char kMicrosoftAuthClientId[] = "c36a9fb6-4f2a-41ff-90bd-ae7cc92031eb";
 static constexpr char kMicrosoftAuthScopes[] = "XboxLive.signin offline_access";
@@ -89,6 +93,11 @@ static void WriteLog(const wchar_t* msg);
 static void WriteLogF(const wchar_t* fmt, ...);
 static std::string w2a(const std::wstring& w);
 static std::wstring a2w(const char* utf8);
+
+struct LogTailerConfig {
+    std::wstring path;
+    std::wstring label;
+};
 
 static std::wstring GetExecutableDir() {
     wchar_t buf[MAX_PATH];
@@ -408,14 +417,10 @@ static void WriteLogF(const wchar_t* fmt, ...) {
     WriteLog(buf.data());
 }
 
-static void TerminateIfMinecraftRunning(const wchar_t* reason) {
-    if (!g_minecraftRunning.load()) {
-        WriteLogF(L"%s ignored; Minecraft is not running", reason ? reason : L"Lifecycle event");
-        return;
-    }
-
-    WriteLogF(L"%s while Minecraft is running; terminating host process", reason ? reason : L"Lifecycle event");
-    ExitProcess(0);
+static void LogLifecycleEvent(const wchar_t* reason) {
+    WriteLogF(L"%s minecraftRunning=%d",
+        reason ? reason : L"Lifecycle event",
+        g_minecraftRunning.load() ? 1 : 0);
 }
 
 static void RegisterLifecycleHandlers(ICoreApplication* coreApp) {
@@ -425,7 +430,7 @@ static void RegisterLifecycleHandlers(ICoreApplication* coreApp) {
     HRESULT hr = coreApp->add_Suspending(
         Callback<IEventHandler<SuspendingEventArgs*>>(
             [](IInspectable*, ISuspendingEventArgs*) -> HRESULT {
-                TerminateIfMinecraftRunning(L"CoreApplication Suspending");
+                LogLifecycleEvent(L"CoreApplication Suspending");
                 return S_OK;
             }).Get(),
         &token);
@@ -454,7 +459,7 @@ static void RegisterLifecycleHandlers(ICoreApplication* coreApp) {
     hr = coreApp2->add_EnteredBackground(
         Callback<IEventHandler<EnteredBackgroundEventArgs*>>(
             [](IInspectable*, IEnteredBackgroundEventArgs*) -> HRESULT {
-                TerminateIfMinecraftRunning(L"CoreApplication EnteredBackground");
+                LogLifecycleEvent(L"CoreApplication EnteredBackground");
                 return S_OK;
             }).Get(),
         &token);
@@ -479,7 +484,7 @@ static void RegisterCoreWindowLifecycleHandlers(ICoreWindow* window) {
 
     g_coreWindowClosedHandler = Callback<CoreWindowClosedHandler>(
         [](ICoreWindow*, ICoreWindowEventArgs*) -> HRESULT {
-            TerminateIfMinecraftRunning(L"CoreWindow Closed");
+            LogLifecycleEvent(L"CoreWindow Closed");
             return S_OK;
         });
 
@@ -510,33 +515,32 @@ static void RegisterCoreWindowLifecycleHandlers(ICoreWindow* window) {
 }
 
 static void LogTextFileTail(const std::wstring& path, const wchar_t* label, DWORD maxBytes = 16384) {
-    FILE* file = nullptr;
-    errno_t openErr = _wfopen_s(&file, path.c_str(), L"rb");
-    if (openErr != 0 || !file) {
+    int fd = -1;
+    errno_t openErr = _wsopen_s(&fd, path.c_str(), _O_RDONLY | _O_BINARY, _SH_DENYNO, _S_IREAD);
+    if (openErr != 0 || fd < 0) {
         WriteLogF(L"%s unavailable: %s errno=%d winerr=%u", label ? label : L"log file", path.c_str(), openErr, GetLastError());
         return;
     }
 
-    _fseeki64(file, 0, SEEK_END);
-    const __int64 size = _ftelli64(file);
+    const __int64 size = _lseeki64(fd, 0, SEEK_END);
     if (size <= 0) {
-        fclose(file);
+        _close(fd);
         WriteLogF(L"%s empty: %s", label ? label : L"log file", path.c_str());
         return;
     }
 
     const DWORD bytesToRead = static_cast<DWORD>(size < maxBytes ? size : maxBytes);
-    _fseeki64(file, size - bytesToRead, SEEK_SET);
+    _lseeki64(fd, size - bytesToRead, SEEK_SET);
 
     std::string data(bytesToRead, '\0');
-    const size_t bytesRead = fread(data.data(), 1, bytesToRead, file);
-    fclose(file);
-    if (bytesRead == 0) {
+    const int bytesRead = _read(fd, data.data(), bytesToRead);
+    _close(fd);
+    if (bytesRead <= 0) {
         WriteLogF(L"%s read failed: %s errno=%d", label ? label : L"log file", path.c_str(), errno);
         return;
     }
 
-    data.resize(bytesRead);
+    data.resize(static_cast<size_t>(bytesRead));
     for (char& ch : data) {
         if (ch == '\0') ch = ' ';
     }
@@ -552,6 +556,146 @@ static void LogTextFileTail(const std::wstring& path, const wchar_t* label, DWOR
 
     WriteLogF(L"%s tail (%u bytes):\n%s", label ? label : L"log file", static_cast<unsigned>(bytesRead), wide.c_str());
 }
+
+static void LogUtf8Chunk(const std::wstring& label, const char* data, DWORD length) {
+    if (!data || length == 0) return;
+
+    UINT codePage = CP_UTF8;
+    int wideLen = MultiByteToWideChar(codePage, 0, data, static_cast<int>(length), nullptr, 0);
+    if (wideLen <= 0) {
+        codePage = CP_ACP;
+        wideLen = MultiByteToWideChar(codePage, 0, data, static_cast<int>(length), nullptr, 0);
+    }
+    if (wideLen <= 0) return;
+
+    std::wstring wide(static_cast<size_t>(wideLen), L'\0');
+    MultiByteToWideChar(codePage, 0, data, static_cast<int>(length), wide.data(), wideLen);
+    for (wchar_t& ch : wide) {
+        if (ch == L'\0') ch = L' ';
+    }
+
+    while (!wide.empty() && (wide.back() == L'\r' || wide.back() == L'\n')) {
+        wide.pop_back();
+    }
+    if (!wide.empty()) {
+        WriteLogF(L"%s:\n%s", label.empty() ? L"log" : label.c_str(), wide.c_str());
+    }
+}
+
+static DWORD WINAPI LogTailerThreadProc(LPVOID param) {
+    std::wstring path;
+    std::wstring label;
+    if (param) {
+        LogTailerConfig* config = static_cast<LogTailerConfig*>(param);
+        path = config->path;
+        label = config->label;
+        delete config;
+    }
+
+    LARGE_INTEGER offset = {};
+    char buffer[4096];
+    bool attached = false;
+
+    while (InterlockedCompareExchange(&g_logTailerRunning, 1, 1) == 1) {
+        HANDLE file = CreateFile2(
+            path.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            OPEN_EXISTING,
+            nullptr);
+
+        if (file != INVALID_HANDLE_VALUE) {
+            if (!attached) {
+                WriteLogF(L"log tailer attached: %s -> %s", label.c_str(), path.c_str());
+                attached = true;
+            }
+
+            LARGE_INTEGER fileSize = {};
+            if (GetFileSizeEx(file, &fileSize)) {
+                if (offset.QuadPart > fileSize.QuadPart) {
+                    offset.QuadPart = 0;
+                }
+
+                SetFilePointerEx(file, offset, nullptr, FILE_BEGIN);
+                for (;;) {
+                    DWORD bytesRead = 0;
+                    if (!ReadFile(file, buffer, sizeof(buffer), &bytesRead, nullptr) || bytesRead == 0) {
+                        break;
+                    }
+                    offset.QuadPart += bytesRead;
+                    LogUtf8Chunk(label, buffer, bytesRead);
+                }
+            }
+            CloseHandle(file);
+        }
+
+        Sleep(250);
+    }
+
+    return 0;
+}
+
+static void StartOneLogTailer(const LogTailerConfig& config) {
+    if (config.path.empty() ||
+        g_logTailerThreadCount >= static_cast<int>(sizeof(g_logTailerThreads) / sizeof(g_logTailerThreads[0]))) {
+        return;
+    }
+
+    LogTailerConfig* threadConfig = new (std::nothrow) LogTailerConfig(config);
+    if (!threadConfig) {
+        WriteLogF(L"Failed to allocate log tailer config for %s", config.label.c_str());
+        return;
+    }
+
+    HANDLE thread = CreateThread(nullptr, 0, LogTailerThreadProc, threadConfig, 0, nullptr);
+    if (!thread) {
+        delete threadConfig;
+        WriteLogF(L"Failed to start log tailer for %s err=%u", config.label.c_str(), GetLastError());
+        return;
+    }
+
+    g_logTailerThreads[g_logTailerThreadCount++] = thread;
+}
+
+static bool StartLogTailers(const std::vector<LogTailerConfig>& configs) {
+    if (configs.empty()) return false;
+    if (InterlockedCompareExchange(&g_logTailerRunning, 1, 0) != 0) return false;
+
+    g_logTailerThreadCount = 0;
+    for (const auto& config : configs) {
+        StartOneLogTailer(config);
+    }
+
+    if (g_logTailerThreadCount == 0) {
+        InterlockedExchange(&g_logTailerRunning, 0);
+        return false;
+    }
+
+    WriteLogF(L"started %d log tailer(s)", g_logTailerThreadCount);
+    return true;
+}
+
+static void StopLogTailers() {
+    if (InterlockedExchange(&g_logTailerRunning, 0) == 0) return;
+    for (int i = 0; i < g_logTailerThreadCount; ++i) {
+        if (!g_logTailerThreads[i]) continue;
+        WaitForSingleObject(g_logTailerThreads[i], 1000);
+        CloseHandle(g_logTailerThreads[i]);
+        g_logTailerThreads[i] = NULL;
+    }
+    g_logTailerThreadCount = 0;
+}
+
+struct LogTailerGuard {
+    bool active;
+
+    explicit LogTailerGuard(bool started) : active(started) {}
+    ~LogTailerGuard() {
+        if (active) {
+            StopLogTailers();
+        }
+    }
+};
 
 static bool WriteHwndFile(const std::wstring& dir, HWND hwnd) {
     if (dir.empty() || !hwnd) return false;
@@ -2059,7 +2203,7 @@ static bool ResolveLaunchAuthConfig(ICoreWindow* window, LaunchAuthConfig& out) 
 
 static bool RedirectStdStreams(const std::wstring& path) {
     int fd = -1;
-    if (_wsopen_s(&fd, path.c_str(), _O_CREAT | _O_APPEND | _O_WRONLY | _O_TEXT,
+    if (_wsopen_s(&fd, path.c_str(), _O_CREAT | _O_TRUNC | _O_WRONLY | _O_TEXT,
         _SH_DENYNO, _S_IREAD | _S_IWRITE) != 0 || fd < 0) {
         return false;
     }
@@ -2074,8 +2218,8 @@ static bool RedirectStdStreams(const std::wstring& path) {
     }
     _close(fd);
 
-    FILE* out = _fdopen(1, "a");
-    FILE* err = _fdopen(2, "a");
+    FILE* out = _fdopen(1, "w");
+    FILE* err = _fdopen(2, "w");
     if (!out || !err) {
         return false;
     }
@@ -2403,7 +2547,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     const LaunchAuthConfig& authConfig)
 {
     const std::wstring jnaTmpDir = nativesDir;
-    const std::wstring lwjglTmpDir = exeDir + L"\\lwjgl-cache";
+    const std::wstring lwjglTmpDir = exeDir + L"\\tmp";
     const std::wstring packagedNativesDir = packageDir + L"\\natives";
     const std::wstring lwjglNativeDir =
         GetFileAttributesW((packagedNativesDir + L"\\lwjgl.dll").c_str()) != INVALID_FILE_ATTRIBUTES &&
@@ -2413,17 +2557,30 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     const std::wstring lwjglGlfwDll = lwjglNativeDir + L"\\glfw.dll";
     const std::wstring logConfigPath = gameDir + L"\\log_configs\\client-uwp.xml";
     const std::wstring fabricLogPath = gameDir + L"\\logs\\fabric-loader.log";
+    const std::wstring latestLogPath = gameDir + L"\\logs\\latest.log";
+    const std::wstring xboxCompatLogPath = gameDir + L"\\xbox_compat.log";
 
     EnsureDirectoryTree(gameDir + L"\\logs");
     EnsureDirectoryTree(gameDir + L"\\crash-reports");
     EnsureDirectoryTree(userModsDir);
     EnsureDirectoryTree(lwjglTmpDir);
+    DeleteFileW(fabricLogPath.c_str());
+    DeleteFileW(latestLogPath.c_str());
+    DeleteFileW(xboxCompatLogPath.c_str());
 
     if (!RedirectStdStreams(javaLog)) {
         WriteLogF(L"Failed to redirect stdout/stderr errno=%d winerr=%u", errno, GetLastError());
     } else {
         WriteLog(L"stdout/stderr redirected to java_output.log");
     }
+
+    const std::vector<LogTailerConfig> tailerConfigs = {
+        LogTailerConfig{ javaLog, L"java_output.log" },
+        LogTailerConfig{ fabricLogPath, L"fabric-loader.log" },
+        LogTailerConfig{ latestLogPath, L"latest.log" },
+        LogTailerConfig{ xboxCompatLogPath, L"xbox_compat.log" }
+    };
+    LogTailerGuard logTailers(StartLogTailers(tailerConfigs));
 
     FILE* af = nullptr;
     _wfopen_s(&af, argsPath.c_str(), L"w");
@@ -2462,9 +2619,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     vmOptionStorage.push_back("-Dorg.lwjgl.librarypath=" + w2a(fwd(lwjglNativeDir)));
     vmOptionStorage.push_back("-Dorg.lwjgl.util.Debug=true");
     vmOptionStorage.push_back("-Dorg.lwjgl.util.DebugLoader=true");
-    vmOptionStorage.push_back("-Dorg.lwjgl.system.SharedLibraryExtractPath=" + w2a(fwd(lwjglTmpDir)));
     vmOptionStorage.push_back("-Dorg.lwjgl.system.SharedLibraryExtractDirectory=" + w2a(fwd(lwjglTmpDir)));
-    vmOptionStorage.push_back("-Dorg.lwjgl.system.SharedLibraryExtractForce=true");
     vmOptionStorage.push_back("-Dorg.lwjgl.glfw.libname=" + w2a(fwd(lwjglGlfwDll)));
     WriteLogF(L"LWJGL native directory: %s", lwjglNativeDir.c_str());
     WriteLogF(L"LWJGL GLFW library forced: %s", lwjglGlfwDll.c_str());
@@ -2492,6 +2647,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     vmOptionStorage.push_back("-Djava.class.path=" + w2a(classPath));
     vmOptionStorage.push_back("-Duser.dir=" + w2a(fwd(gameDir)));
     vmOptionStorage.push_back("-Dlog4j.configurationFile=" + w2a(fwd(logConfigPath)));
+    vmOptionStorage.push_back("-XX:ErrorFile=" + w2a(fwd(gameDir + L"\\hs_err_pid%p.log")));
 
     const std::vector<std::string> appArgs = {
         "--username", authConfig.username,
@@ -2607,8 +2763,10 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     }
 
     WriteLog(L"KnotClient.main returned");
-    WriteLog(L"Minecraft exited; terminating host process instead of destroying embedded JVM");
-    ExitProcess(0);
+    g_minecraftRunning.store(false);
+    const jint destroyResult = vm->DestroyJavaVM();
+    WriteLogF(L"DestroyJavaVM => %d", destroyResult);
+    return true;
 }
 
 class App : public RuntimeClass<RuntimeClassFlags<WinRtClassicComMix>, IFrameworkView>
