@@ -73,3 +73,4 @@ __pycache__/
 
 # Local auth config
 /MC.Xbox/launch_auth.json
+buildcmd.txt
