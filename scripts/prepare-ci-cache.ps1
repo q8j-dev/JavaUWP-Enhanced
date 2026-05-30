@@ -169,6 +169,7 @@ if (-not (Test-Path $remappedJar)) {
     $jars += $clientJar
     $classpath = $jars -join ";"
     $remapLog = Join-Path $notesDir "fabric-remap.log"
+    New-Item -ItemType Directory -Force -Path (Join-Path $gameDir "logs") | Out-Null
 
     $javaArgs = @(
         "-Dfabric.gameJarPath=$clientJar",
@@ -187,8 +188,17 @@ if (-not (Test-Path $remappedJar)) {
         "--versionType", "release"
     )
 
-    & $javaExe @javaArgs *>&1 | Tee-Object -FilePath $remapLog
-    $fabricExitCode = $LASTEXITCODE
+    Push-Location $gameDir
+    try {
+        $previousErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        & $javaExe @javaArgs 2>&1 | Tee-Object -FilePath $remapLog
+        $fabricExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+        Pop-Location
+    }
+
     if (-not (Test-Path $remappedJar)) {
         throw "Fabric remapped client jar was not created. See $remapLog."
     }
