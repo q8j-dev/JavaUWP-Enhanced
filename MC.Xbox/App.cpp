@@ -37,13 +37,18 @@
 #include <iomanip>
 #include <winhttp.h>
 #include <bcrypt.h>
+#include <map>
+#include <set>
 #include <winrt/base.h>
+#include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Security.Credentials.h>
 #include <winrt/Windows.Security.ExchangeActiveSyncProvisioning.h>
 #include <winrt/Windows.Storage.Streams.h>
 #include <winrt/Windows.Web.Http.h>
 #include <winrt/Windows.Web.Http.Headers.h>
+#include <winrt/Windows.UI.Core.h>
 
 #include "runtime_config.h"
 #include "qr_code.h"
@@ -1554,6 +1559,27 @@ struct LaunchAuthConfig {
     std::string accessToken;
 };
 
+struct ModCard {
+    std::wstring projectId;
+    std::wstring slug;
+    std::wstring title;
+    std::wstring description;
+    std::wstring iconPath;
+    std::wstring iconUrl;
+    std::wstring filePath;
+    std::wstring status;
+    bool installed = false;
+};
+
+static std::mutex g_modsSearchMutex;
+static std::wstring g_modsSearchBuffer;
+static bool g_modsSearchDirty = false;
+static std::atomic<bool> g_modsSearchCapturing{false};
+
+// render computes how many card rows fit; the input loop reads this to keep the
+// selection on screen without duplicating the layout math
+static std::atomic<int> g_modsRowsVisible{1};
+
 static std::string ExtractJsonStringValue(const std::string& content, const char* key) {
     if (!key || !*key) return {};
     const std::string needle = std::string("\"") + key + "\"";
@@ -1732,6 +1758,531 @@ static HttpResult HttpGetBearer(const wchar_t* url, const std::string& token) {
     return result;
 }
 
+static HttpResult HttpGetString(const wchar_t* url) {
+    HttpResult result;
+    try {
+        using namespace winrt::Windows::Foundation;
+        using namespace winrt::Windows::Web::Http;
+
+        HttpClient client;
+        HttpRequestMessage request(HttpMethod::Get(), winrt::Windows::Foundation::Uri(url));
+        request.Headers().UserAgent().ParseAdd(L"BanditVault-BanditLauncher/1.0");
+        HttpResponseMessage response = client.SendRequestAsync(request).get();
+        result.status = static_cast<int>(response.StatusCode());
+        result.body = winrt::to_string(response.Content().ReadAsStringAsync().get());
+    } catch (const winrt::hresult_error& ex) {
+        WriteLogF(L"HTTP GET failed url=%s hr=0x%08X msg=%s",
+            url, static_cast<unsigned int>(ex.code()), ex.message().c_str());
+    }
+    return result;
+}
+
+static std::wstring JsonStringOrEmpty(const winrt::Windows::Data::Json::JsonObject& obj, const wchar_t* key) {
+    using namespace winrt::Windows::Data::Json;
+    if (!key || !obj.HasKey(key)) return {};
+    try {
+        const auto value = obj.GetNamedValue(key);
+        if (value.ValueType() == JsonValueType::String) {
+            return std::wstring(obj.GetNamedString(key).c_str());
+        }
+    } catch (...) {
+    }
+    return {};
+}
+
+static int JsonIntOrZero(const winrt::Windows::Data::Json::JsonObject& obj, const wchar_t* key) {
+    using namespace winrt::Windows::Data::Json;
+    if (!key || !obj.HasKey(key)) return 0;
+    try {
+        const auto value = obj.GetNamedValue(key);
+        if (value.ValueType() == JsonValueType::Number) {
+            return static_cast<int>(obj.GetNamedNumber(key));
+        }
+    } catch (...) {
+    }
+    return 0;
+}
+
+static bool JsonBoolOrFalse(const winrt::Windows::Data::Json::JsonObject& obj, const wchar_t* key) {
+    using namespace winrt::Windows::Data::Json;
+    if (!key || !obj.HasKey(key)) return false;
+    try {
+        const auto value = obj.GetNamedValue(key);
+        if (value.ValueType() == JsonValueType::Boolean) {
+            return obj.GetNamedBoolean(key);
+        }
+    } catch (...) {
+    }
+    return false;
+}
+
+static std::wstring SafeFileName(std::wstring value) {
+    for (wchar_t& ch : value) {
+        if (ch < 32 || wcschr(L"<>:\"/\\|?*", ch)) {
+            ch = L'_';
+        }
+    }
+    if (value.empty()) value = L"mod";
+    return value;
+}
+
+static std::wstring ModIconCachePath(const std::wstring& runtimeRoot, const std::wstring& projectId) {
+    return runtimeRoot + L"\\mod-icons\\" + SafeFileName(projectId) + L".img";
+}
+
+static std::wstring CacheModIcon(const std::wstring& runtimeRoot, const std::wstring& projectId, const std::wstring& iconUrl) {
+    if (runtimeRoot.empty() || projectId.empty() || iconUrl.empty()) return {};
+    const std::wstring path = ModIconCachePath(runtimeRoot, projectId);
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        return path;
+    }
+
+    WriteLogF(L"Downloading Modrinth icon project=%s", projectId.c_str());
+    if (DownloadUrlToFile(iconUrl, path, nullptr)) {
+        return path;
+    }
+
+    DeleteFileW(path.c_str());
+    WriteLogF(L"Modrinth icon download failed project=%s url=%s", projectId.c_str(), iconUrl.c_str());
+    return {};
+}
+
+static std::wstring BuildModrinthSearchUrl(const char* index, int limit, int offset, const std::wstring& query) {
+    const std::string facets =
+        "[[\"project_type:mod\"],[\"categories:fabric\"],[\"versions:" +
+        std::string(kMinecraftVersion) +
+        "\"],[\"client_side:required\",\"client_side:optional\"]]";
+    std::wstring url = L"https://api.modrinth.com/v2/search?limit=" +
+        std::to_wstring(limit) +
+        L"&offset=" + std::to_wstring(offset) +
+        L"&index=" + a2w(index) +
+        L"&facets=" + a2w(FormUrlEncode(facets).c_str());
+    if (!query.empty()) {
+        url += L"&query=" + a2w(FormUrlEncode(w2a(query)).c_str());
+    }
+    return url;
+}
+
+struct IconJob {
+    std::wstring url;
+    std::wstring path;
+};
+
+static std::mutex g_iconMutex;
+static std::vector<IconJob> g_iconJobs;
+static size_t g_iconCursor = 0;
+static std::atomic<bool> g_iconWorkerRun{false};
+static std::thread g_iconWorker;
+
+// icons stream in on a worker so the grid renders instantly and a large result
+// set doesn't block the UI on sequential downloads
+static void IconWorkerLoop() {
+    while (g_iconWorkerRun.load()) {
+        IconJob job;
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> lk(g_iconMutex);
+            if (g_iconCursor < g_iconJobs.size()) {
+                job = g_iconJobs[g_iconCursor++];
+                have = true;
+            }
+        }
+        if (!have) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            continue;
+        }
+        if (GetFileAttributesW(job.path.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+        DownloadUrlToFile(job.url, job.path, nullptr);
+    }
+}
+
+static void StartIconWorker() {
+    if (g_iconWorkerRun.load()) return;
+    g_iconWorkerRun.store(true);
+    g_iconWorker = std::thread(IconWorkerLoop);
+}
+
+static void StopIconWorker() {
+    g_iconWorkerRun.store(false);
+    if (g_iconWorker.joinable()) g_iconWorker.join();
+    std::lock_guard<std::mutex> lk(g_iconMutex);
+    g_iconJobs.clear();
+    g_iconCursor = 0;
+}
+
+static void QueueModIcons(const std::vector<ModCard>& cards) {
+    std::lock_guard<std::mutex> lk(g_iconMutex);
+    g_iconJobs.clear();
+    g_iconCursor = 0;
+    for (const auto& c : cards) {
+        if (!c.iconUrl.empty() && !c.iconPath.empty() &&
+            GetFileAttributesW(c.iconPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            g_iconJobs.push_back({ c.iconUrl, c.iconPath });
+        }
+    }
+}
+
+static void QueueModIconsAppend(const std::vector<ModCard>& cards, size_t startIndex) {
+    std::lock_guard<std::mutex> lk(g_iconMutex);
+    for (size_t i = startIndex; i < cards.size(); ++i) {
+        const auto& c = cards[i];
+        if (!c.iconUrl.empty() && !c.iconPath.empty() &&
+            GetFileAttributesW(c.iconPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            g_iconJobs.push_back({ c.iconUrl, c.iconPath });
+        }
+    }
+}
+
+static std::wstring ModMetaPath(const std::wstring& runtimeRoot, const std::wstring& fileName) {
+    return runtimeRoot + L"\\mod-meta\\" + SafeFileName(fileName) + L".meta";
+}
+
+static std::wstring StripNewlines(std::wstring value) {
+    for (wchar_t& ch : value) {
+        if (ch == L'\r' || ch == L'\n' || ch == L'\t') ch = L' ';
+    }
+    return value;
+}
+
+static void WriteModMeta(const std::wstring& runtimeRoot, const std::wstring& fileName, const ModCard& card) {
+    const std::wstring path = ModMetaPath(runtimeRoot, fileName);
+    EnsureDirectoryTree(GetParentDir(path));
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    const std::string body =
+        "title\t" + w2a(StripNewlines(card.title)) + "\n" +
+        "desc\t" + w2a(StripNewlines(card.description)) + "\n" +
+        "icon\t" + w2a(card.iconPath) + "\n";
+    f.write(body.data(), static_cast<std::streamsize>(body.size()));
+}
+
+static bool ReadModMeta(const std::wstring& runtimeRoot, const std::wstring& fileName, ModCard& card) {
+    const std::wstring path = ModMetaPath(runtimeRoot, fileName);
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    std::string line;
+    bool any = false;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const size_t tab = line.find('\t');
+        if (tab == std::string::npos) continue;
+        const std::string key = line.substr(0, tab);
+        const std::wstring value = a2w(line.substr(tab + 1).c_str());
+        if (key == "title" && !value.empty()) { card.title = value; any = true; }
+        else if (key == "desc" && !value.empty()) { card.description = value; any = true; }
+        else if (key == "icon") {
+            if (!value.empty() && GetFileAttributesW(value.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                card.iconPath = value;
+            }
+            any = true;
+        }
+    }
+    return any;
+}
+
+static bool ResolveInstalledModMeta(const std::wstring& runtimeRoot, const std::wstring& jarPath, ModCard& card) {
+    using namespace winrt::Windows::Data::Json;
+    std::string sha1;
+    if (!Sha1File(jarPath, &sha1) || sha1.empty()) return false;
+
+    const std::wstring versionUrl =
+        L"https://api.modrinth.com/v2/version_file/" + a2w(sha1.c_str()) + L"?algorithm=sha1";
+    const HttpResult versionResp = HttpGetString(versionUrl.c_str());
+    if (!versionResp.success()) return false;
+
+    std::wstring projectId;
+    try {
+        JsonObject version = JsonObject::Parse(winrt::to_hstring(versionResp.body));
+        projectId = JsonStringOrEmpty(version, L"project_id");
+    } catch (...) {
+        return false;
+    }
+    if (projectId.empty()) return false;
+
+    const std::wstring projectUrl =
+        L"https://api.modrinth.com/v2/project/" + a2w(FormUrlEncode(w2a(projectId)).c_str());
+    const HttpResult projectResp = HttpGetString(projectUrl.c_str());
+    if (!projectResp.success()) return false;
+
+    try {
+        JsonObject project = JsonObject::Parse(winrt::to_hstring(projectResp.body));
+        const std::wstring title = JsonStringOrEmpty(project, L"title");
+        const std::wstring desc = JsonStringOrEmpty(project, L"description");
+        const std::wstring iconUrl = JsonStringOrEmpty(project, L"icon_url");
+        if (!title.empty()) card.title = title;
+        if (!desc.empty()) card.description = desc;
+        card.projectId = projectId;
+        card.iconPath = CacheModIcon(runtimeRoot, projectId, iconUrl);
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+static bool LoadInstalledMods(const std::wstring& runtimeRoot, const std::wstring& userModsDir, std::vector<ModCard>& out) {
+    out.clear();
+    EnsureDirectoryTree(userModsDir);
+
+    WIN32_FIND_DATAW fd = {};
+    HANDLE h = FindFirstFileW((userModsDir + L"\\*.jar").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        return true;
+    }
+
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        std::wstring name = fd.cFileName;
+        ModCard card;
+        card.title = name;
+        card.description = L"Installed in user-mods";
+        card.filePath = userModsDir + L"\\" + name;
+        card.status = L"Installed";
+        card.installed = true;
+
+        if (!ReadModMeta(runtimeRoot, name, card)) {
+            if (!ResolveInstalledModMeta(runtimeRoot, card.filePath, card)) {
+                card.title = name;
+                card.description = L"Installed in user-mods";
+            }
+            WriteModMeta(runtimeRoot, name, card);
+        }
+
+        out.push_back(card);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+
+    std::sort(out.begin(), out.end(), [](const ModCard& a, const ModCard& b) {
+        return _wcsicmp(a.title.c_str(), b.title.c_str()) < 0;
+    });
+    return true;
+}
+
+static const int kModPageSize = 50;
+
+static bool FetchModrinthMods(const std::wstring& runtimeRoot, const char* index, const std::wstring& query, int offset, int limit, std::vector<ModCard>& out, int& totalHits, std::wstring& error) {
+    using namespace winrt::Windows::Data::Json;
+    error.clear();
+
+    const std::wstring url = BuildModrinthSearchUrl(index, limit, offset, query);
+    WriteLogF(L"Modrinth search url=%s", url.c_str());
+    const HttpResult response = HttpGetString(url.c_str());
+    if (!response.success()) {
+        error = L"Modrinth search failed HTTP " + std::to_wstring(response.status);
+        WriteLogF(L"%s", error.c_str());
+        return false;
+    }
+
+    try {
+        JsonObject root = JsonObject::Parse(winrt::to_hstring(response.body));
+        if (!root.HasKey(L"hits") || root.GetNamedValue(L"hits").ValueType() != JsonValueType::Array) {
+            error = L"Modrinth search returned no hits";
+            return false;
+        }
+        totalHits = JsonIntOrZero(root, L"total_hits");
+
+        JsonArray hits = root.GetNamedArray(L"hits");
+        for (uint32_t i = 0; i < hits.Size(); ++i) {
+            auto value = hits.GetAt(i);
+            if (value.ValueType() != JsonValueType::Object) continue;
+            JsonObject hit = value.GetObject();
+
+            ModCard card;
+            card.projectId = JsonStringOrEmpty(hit, L"project_id");
+            card.slug = JsonStringOrEmpty(hit, L"slug");
+            card.title = JsonStringOrEmpty(hit, L"title");
+            card.description = JsonStringOrEmpty(hit, L"description");
+            const std::wstring iconUrl = JsonStringOrEmpty(hit, L"icon_url");
+            if (card.title.empty()) card.title = card.slug.empty() ? card.projectId : card.slug;
+            if (card.description.empty()) {
+                card.description = L"Fabric mod for Minecraft " + a2w(kMinecraftVersion);
+            }
+            card.status = std::to_wstring(JsonIntOrZero(hit, L"downloads")) + L" downloads";
+            if (!iconUrl.empty()) {
+                card.iconUrl = iconUrl;
+                card.iconPath = ModIconCachePath(runtimeRoot, card.projectId.empty() ? card.slug : card.projectId);
+            }
+            out.push_back(card);
+        }
+    } catch (const winrt::hresult_error& ex) {
+        error = L"Could not parse Modrinth search response";
+        WriteLogF(L"Modrinth search parse failed hr=0x%08X msg=%s",
+            static_cast<unsigned int>(ex.code()), ex.message().c_str());
+        return false;
+    }
+
+    return true;
+}
+
+static bool ExtractPrimaryModrinthFile(
+    const winrt::Windows::Data::Json::JsonObject& version,
+    std::wstring& url,
+    std::wstring& filename,
+    std::string& sha1) {
+    using namespace winrt::Windows::Data::Json;
+    if (!version.HasKey(L"files") || version.GetNamedValue(L"files").ValueType() != JsonValueType::Array) {
+        return false;
+    }
+
+    JsonArray files = version.GetNamedArray(L"files");
+    JsonObject selected = nullptr;
+    for (uint32_t i = 0; i < files.Size(); ++i) {
+        auto value = files.GetAt(i);
+        if (value.ValueType() != JsonValueType::Object) continue;
+        JsonObject file = value.GetObject();
+        if (!selected || JsonBoolOrFalse(file, L"primary")) {
+            selected = file;
+            if (JsonBoolOrFalse(file, L"primary")) break;
+        }
+    }
+    if (!selected) return false;
+
+    url = JsonStringOrEmpty(selected, L"url");
+    filename = JsonStringOrEmpty(selected, L"filename");
+    if (selected.HasKey(L"hashes") &&
+        selected.GetNamedValue(L"hashes").ValueType() == JsonValueType::Object) {
+        sha1 = w2a(JsonStringOrEmpty(selected.GetNamedObject(L"hashes"), L"sha1"));
+    }
+    return !url.empty() && !filename.empty();
+}
+
+static bool InstallModrinthProjectRecursive(
+    const std::wstring& projectIdOrSlug,
+    const std::wstring& runtimeRoot,
+    const std::wstring& userModsDir,
+    std::set<std::wstring>& visited,
+    std::vector<std::wstring>& installed,
+    const ModCard* topMeta,
+    std::wstring& error) {
+    using namespace winrt::Windows::Data::Json;
+    if (projectIdOrSlug.empty()) {
+        error = L"Missing Modrinth project id";
+        return false;
+    }
+    if (visited.find(projectIdOrSlug) != visited.end()) {
+        return true;
+    }
+    visited.insert(projectIdOrSlug);
+
+    const std::string project = w2a(projectIdOrSlug);
+    const std::string loaders = FormUrlEncode("[\"fabric\"]");
+    const std::string versions = FormUrlEncode("[\"" + std::string(kMinecraftVersion) + "\"]");
+    const std::wstring url =
+        L"https://api.modrinth.com/v2/project/" + a2w(FormUrlEncode(project).c_str()) +
+        L"/version?loaders=" + a2w(loaders.c_str()) +
+        L"&game_versions=" + a2w(versions.c_str()) +
+        L"&include_changelog=false";
+
+    WriteLogF(L"Modrinth versions url=%s", url.c_str());
+    const HttpResult response = HttpGetString(url.c_str());
+    if (!response.success()) {
+        error = L"Modrinth version lookup failed HTTP " + std::to_wstring(response.status);
+        WriteLogF(L"%s project=%s", error.c_str(), projectIdOrSlug.c_str());
+        return false;
+    }
+
+    try {
+        JsonArray versionsArray = JsonArray::Parse(winrt::to_hstring(response.body));
+        if (versionsArray.Size() == 0) {
+            error = L"No Fabric " + a2w(kMinecraftVersion) + L" version was found";
+            return false;
+        }
+
+        JsonObject version = nullptr;
+        for (uint32_t i = 0; i < versionsArray.Size(); ++i) {
+            auto value = versionsArray.GetAt(i);
+            if (value.ValueType() != JsonValueType::Object) continue;
+            JsonObject candidate = value.GetObject();
+            if (JsonStringOrEmpty(candidate, L"version_type") == L"release") {
+                version = candidate;
+                break;
+            }
+            if (!version) version = candidate;
+        }
+        if (!version) {
+            error = L"No installable Modrinth version was found";
+            return false;
+        }
+
+        if (version.HasKey(L"dependencies") &&
+            version.GetNamedValue(L"dependencies").ValueType() == JsonValueType::Array) {
+            JsonArray dependencies = version.GetNamedArray(L"dependencies");
+            for (uint32_t i = 0; i < dependencies.Size(); ++i) {
+                auto depValue = dependencies.GetAt(i);
+                if (depValue.ValueType() != JsonValueType::Object) continue;
+                JsonObject dep = depValue.GetObject();
+                if (JsonStringOrEmpty(dep, L"dependency_type") != L"required") continue;
+                const std::wstring depProject = JsonStringOrEmpty(dep, L"project_id");
+                if (!depProject.empty() &&
+                    !InstallModrinthProjectRecursive(depProject, runtimeRoot, userModsDir, visited, installed, nullptr, error)) {
+                    return false;
+                }
+            }
+        }
+
+        std::wstring downloadUrl;
+        std::wstring filename;
+        std::string sha1;
+        if (!ExtractPrimaryModrinthFile(version, downloadUrl, filename, sha1)) {
+            error = L"Modrinth version did not include a downloadable file";
+            return false;
+        }
+
+        EnsureDirectoryTree(userModsDir);
+        const std::wstring destination = userModsDir + L"\\" + SafeFileName(filename);
+        if (FileMatchesSha1(destination, sha1)) {
+            WriteLogF(L"Mod already installed: %s", destination.c_str());
+            return true;
+        }
+
+        const std::wstring tempPath = destination + L".download";
+        DeleteFileW(tempPath.c_str());
+        WriteLogF(L"Downloading Modrinth mod %s", filename.c_str());
+        if (!DownloadUrlToFile(downloadUrl, tempPath, nullptr)) {
+            DeleteFileW(tempPath.c_str());
+            error = L"Mod download failed: " + filename;
+            return false;
+        }
+
+        if (!FileMatchesSha1(tempPath, sha1)) {
+            DeleteFileW(tempPath.c_str());
+            error = L"Mod verification failed: " + filename;
+            return false;
+        }
+
+        DeleteFileW(destination.c_str());
+        if (!MoveFileExW(tempPath.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            DeleteFileW(tempPath.c_str());
+            error = L"Could not install mod: " + filename;
+            WriteLogF(L"MoveFileEx failed for mod %s err=%u", destination.c_str(), GetLastError());
+            return false;
+        }
+
+        installed.push_back(filename);
+        if (topMeta) {
+            ModCard meta = *topMeta;
+            WriteModMeta(runtimeRoot, filename, meta);
+        }
+        WriteLogF(L"Installed Modrinth mod %s", destination.c_str());
+        return true;
+    } catch (const winrt::hresult_error& ex) {
+        error = L"Could not parse Modrinth version response";
+        WriteLogF(L"Modrinth version parse failed hr=0x%08X msg=%s",
+            static_cast<unsigned int>(ex.code()), ex.message().c_str());
+        return false;
+    }
+}
+
+static bool InstallModrinthProject(
+    const ModCard& card,
+    const std::wstring& runtimeRoot,
+    const std::wstring& userModsDir,
+    std::vector<std::wstring>& installed,
+    std::wstring& error) {
+    std::set<std::wstring> visited;
+    const std::wstring id = !card.projectId.empty() ? card.projectId : card.slug;
+    return InstallModrinthProjectRecursive(id, runtimeRoot, userModsDir, visited, installed, &card, error);
+}
+
 static bool SaveRefreshToken(const std::string& refreshToken) {
     if (refreshToken.empty()) return false;
     try {
@@ -1816,7 +2367,16 @@ struct AuthUiState {
     bool isError = false;
     bool showDeviceCode = true;
     bool showMainMenu = false;
+    bool showModsPage = false;
     int selectedMenuIndex = 0;
+    int selectedModsTab = 0;
+    int selectedModIndex = 0;
+    int modsFocus = 0;
+    int modsScrollRow = 0;
+    int modsTotalHits = 0;
+    bool modsExhausted = false;
+    std::wstring modsSearchQuery;
+    std::vector<ModCard> modsCards;
     float animation = 0.0f;
     float progress = -1.0f;
     QrMatrix qr;
@@ -2021,6 +2581,140 @@ public:
         };
 
         const std::wstring title = state.title.empty() ? L"Microsoft sign-in" : state.title;
+        if (state.showModsPage) {
+            const float left = frame.left + 36.0f;
+            const float tabsRight = frame.left + (frame.right - frame.left) * 0.22f;
+            const float cardsLeft = tabsRight + 34.0f;
+            const float cardsRight = frame.right - 36.0f;
+            const float top = frame.top + 34.0f;
+            const float buttonH = 58.0f;
+            const float buttonGap = 22.0f;
+            const wchar_t* tabs[] = { L"Installed", L"Popular", L"Latest" };
+
+            DrawText(L"Mods", bodyFormat_.Get(), D2D1::RectF(left, top, tabsRight, top + 42.0f), white.Get());
+
+            for (int i = 0; i < 3; ++i) {
+                const float y = top + 76.0f + i * (buttonH + buttonGap);
+                const D2D1_RECT_F tab = D2D1::RectF(left, y, tabsRight, y + buttonH);
+                const bool selected = i == state.selectedModsTab && state.modsFocus == 0;
+                const bool active = i == state.selectedModsTab;
+                if (active) {
+                    d2dContext_->FillRectangle(tab, panel.Get());
+                }
+                d2dContext_->DrawRectangle(tab, selected ? accent.Get() : white.Get(), selected ? 4.0f : 2.0f);
+                DrawText(tabs[i], bodyFormat_.Get(),
+                    D2D1::RectF(tab.left + 14.0f, tab.top + 10.0f, tab.right - 10.0f, tab.bottom - 8.0f),
+                    active ? accent.Get() : white.Get());
+            }
+
+            if (!state.status.empty()) {
+                DrawText(state.status.c_str(), smallFormat_.Get(),
+                    D2D1::RectF(left, frame.bottom - 112.0f, tabsRight, frame.bottom - 30.0f),
+                    state.isError ? danger.Get() : muted.Get());
+            }
+
+            const D2D1_RECT_F list = D2D1::RectF(cardsLeft, top, cardsRight, frame.bottom - 34.0f);
+            d2dContext_->DrawRectangle(list, white.Get(), 2.0f);
+
+            const float pad = 16.0f;
+            const D2D1_RECT_F inner = D2D1::RectF(list.left + pad, list.top + pad, list.right - pad, list.bottom - pad);
+
+            const float searchH = 46.0f;
+            const D2D1_RECT_F search = D2D1::RectF(inner.left, inner.top, inner.right, inner.top + searchH);
+            const bool searchFocused = state.modsFocus == 1;
+            if (searchFocused) {
+                d2dContext_->FillRectangle(search, panel.Get());
+            }
+            d2dContext_->DrawRectangle(search, searchFocused ? accent.Get() : white.Get(), searchFocused ? 4.0f : 2.0f);
+            {
+                const bool placeholder = state.modsSearchQuery.empty() && !searchFocused;
+                std::wstring shown = placeholder ? std::wstring(L"Search mods") : state.modsSearchQuery;
+                if (searchFocused) shown += L"_";
+                DrawText(shown.c_str(), smallFormat_.Get(),
+                    D2D1::RectF(search.left + 14.0f, search.top + 11.0f, search.right - 12.0f, search.bottom - 8.0f),
+                    placeholder ? muted.Get() : white.Get());
+            }
+
+            const float gridTop = search.bottom + 16.0f;
+            const float colGap = 16.0f;
+            const float cardGap = 16.0f;
+            const float cardW = (inner.right - inner.left - colGap) * 0.5f;
+            const float gridH = inner.bottom - gridTop;
+            const float desiredCardH = 150.0f;
+            int rowsVisible = static_cast<int>((gridH + cardGap) / (desiredCardH + cardGap) + 0.5f);
+            if (rowsVisible < 1) rowsVisible = 1;
+            const float cardH = (gridH - cardGap * (rowsVisible - 1)) / static_cast<float>(rowsVisible);
+            g_modsRowsVisible.store(rowsVisible);
+
+            const int count = static_cast<int>(state.modsCards.size());
+            const int totalRows = (count + 1) / 2;
+            const int maxScroll = totalRows > rowsVisible ? totalRows - rowsVisible : 0;
+            int scroll = state.modsScrollRow;
+            if (scroll < 0) scroll = 0;
+            if (scroll > maxScroll) scroll = maxScroll;
+
+            for (int row = scroll; row < scroll + rowsVisible && row < totalRows; ++row) {
+                for (int col = 0; col < 2; ++col) {
+                    const int i = row * 2 + col;
+                    if (i >= count) break;
+                    const float x = inner.left + col * (cardW + colGap);
+                    const float y = gridTop + (row - scroll) * (cardH + cardGap);
+                    const D2D1_RECT_F card = D2D1::RectF(x, y, x + cardW, y + cardH);
+                    const bool selected = state.modsFocus == 2 && i == state.selectedModIndex;
+
+                    d2dContext_->FillRectangle(card, panel.Get());
+                    d2dContext_->DrawRectangle(card, selected ? accent.Get() : white.Get(), selected ? 4.0f : 2.0f);
+
+                    const float imageSide = (std::min)(cardH - 24.0f, 112.0f);
+                    const float imageTop = card.top + (cardH - imageSide) * 0.5f;
+                    const D2D1_RECT_F imageRect = D2D1::RectF(card.left + 14.0f, imageTop, card.left + 14.0f + imageSide, imageTop + imageSide);
+                    ComPtr<ID2D1Bitmap1> icon = GetCachedBitmap(state.modsCards[i].iconPath);
+                    if (icon) {
+                        DrawBitmapCover(icon.Get(), imageRect, 1.0f, 1.0f, 0.0f, 0.0f);
+                    } else {
+                        d2dContext_->FillRectangle(imageRect, black.Get());
+                        d2dContext_->DrawRectangle(imageRect, muted.Get(), 1.0f);
+                        DrawText(L"MOD", smallFormat_.Get(), imageRect, muted.Get());
+                    }
+
+                    const float textLeft = imageRect.right + 16.0f;
+                    const float textRight = card.right - 14.0f;
+                    DrawText(state.modsCards[i].title.c_str(), cardTitleFormat_.Get(),
+                        D2D1::RectF(textLeft, card.top + 12.0f, textRight, card.top + 44.0f),
+                        white.Get());
+                    DrawText(state.modsCards[i].description.c_str(), smallFormat_.Get(),
+                        D2D1::RectF(textLeft, card.top + 46.0f, textRight, card.bottom - 34.0f),
+                        muted.Get());
+                    if (!state.modsCards[i].status.empty()) {
+                        DrawText(state.modsCards[i].status.c_str(), smallFormat_.Get(),
+                            D2D1::RectF(textLeft, card.bottom - 30.0f, textRight, card.bottom - 8.0f),
+                            state.modsCards[i].installed ? accent.Get() : muted.Get());
+                    }
+                }
+            }
+
+            if (maxScroll > 0) {
+                const D2D1_RECT_F track = D2D1::RectF(inner.right - 6.0f, gridTop, inner.right - 2.0f, inner.bottom);
+                d2dContext_->FillRectangle(track, panel.Get());
+                const float trackH = track.bottom - track.top;
+                const float thumbH = trackH * (static_cast<float>(rowsVisible) / static_cast<float>(totalRows));
+                const float thumbY = track.top + (trackH - thumbH) * (static_cast<float>(scroll) / static_cast<float>(maxScroll));
+                d2dContext_->FillRectangle(D2D1::RectF(track.left, thumbY, track.right, thumbY + thumbH), accent.Get());
+            }
+
+            if (state.modsCards.empty()) {
+                const std::wstring emptyText = state.selectedModsTab == 0
+                    ? L"No installed mods"
+                    : L"No mods found";
+                DrawText(emptyText.c_str(), bodyFormat_.Get(),
+                    D2D1::RectF(inner.left + 8.0f, gridTop + 8.0f, inner.right - 8.0f, gridTop + 70.0f),
+                    muted.Get());
+            }
+
+            finishDraw();
+            return;
+        }
+
         if (state.showMainMenu) {
             const float left = frame.left + 36.0f;
             const float menuRight = frame.left + (frame.right - frame.left) * 0.34f;
@@ -2159,8 +2853,10 @@ private:
     ComPtr<IDWriteTextFormat> codeFormat_;
     ComPtr<IDWriteTextFormat> bodyFormat_;
     ComPtr<IDWriteTextFormat> smallFormat_;
+    ComPtr<IDWriteTextFormat> cardTitleFormat_;
     ComPtr<ID2D1Bitmap1> panoramaFaces_[4];
     ComPtr<ID2D1Bitmap1> panoramaOverlay_;
+    std::map<std::wstring, ComPtr<ID2D1Bitmap1>> bitmapCache_;
     bool panoramaLoadAttempted_ = false;
     bool panoramaLoaded_ = false;
     float width_ = 1280.0f;
@@ -2177,6 +2873,9 @@ private:
         dwriteFactory_->CreateTextFormat(
             L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL, 21.0f, L"en-US", smallFormat_.GetAddressOf());
+        dwriteFactory_->CreateTextFormat(
+            L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 22.0f, L"en-US", cardTitleFormat_.GetAddressOf());
 
         if (codeFormat_) {
             codeFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -2190,6 +2889,11 @@ private:
             smallFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             smallFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
         }
+        if (cardTitleFormat_) {
+            cardTitleFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            cardTitleFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+            cardTitleFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        }
     }
 
     void DrawText(const wchar_t* text, IDWriteTextFormat* format, D2D1_RECT_F rect, ID2D1Brush* brush) {
@@ -2201,6 +2905,26 @@ private:
             rect,
             brush,
             D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+
+    ComPtr<ID2D1Bitmap1> GetCachedBitmap(const std::wstring& path) {
+        if (path.empty()) return nullptr;
+        auto found = bitmapCache_.find(path);
+        if (found != bitmapCache_.end()) {
+            return found->second;
+        }
+
+        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            return nullptr;
+        }
+
+        ComPtr<ID2D1Bitmap1> bitmap;
+        if (LoadBitmapFromFile(path, bitmap)) {
+            bitmapCache_[path] = bitmap;
+            return bitmap;
+        }
+
+        return nullptr;
     }
 
     bool LoadBitmapFromFile(const std::wstring& path, ComPtr<ID2D1Bitmap1>& out) {
@@ -2493,7 +3217,373 @@ static bool AnyVirtualKeyDown(ICoreWindow* window, std::initializer_list<ABI::Wi
     return false;
 }
 
-static MainMenuAction ShowMainMenu(ICoreWindow* window, const LaunchAuthConfig& authConfig) {
+static void LoadModsTab(AuthUiState& state, const std::wstring& runtimeRoot, const std::wstring& userModsDir) {
+    state.modsCards.clear();
+    state.selectedModIndex = 0;
+    state.modsScrollRow = 0;
+    state.modsTotalHits = 0;
+    state.modsExhausted = true;
+    state.isError = false;
+
+    const std::wstring query = state.modsSearchQuery;
+
+    if (state.selectedModsTab == 0) {
+        std::vector<ModCard> all;
+        LoadInstalledMods(runtimeRoot, userModsDir, all);
+        if (query.empty()) {
+            state.modsCards = std::move(all);
+        } else {
+            std::wstring lowerNeedle = query;
+            std::transform(lowerNeedle.begin(), lowerNeedle.end(), lowerNeedle.begin(),
+                [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+            for (auto& card : all) {
+                std::wstring hay = card.title + L" " + card.filePath;
+                std::transform(hay.begin(), hay.end(), hay.begin(),
+                    [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+                if (hay.find(lowerNeedle) != std::wstring::npos) {
+                    state.modsCards.push_back(std::move(card));
+                }
+            }
+        }
+        state.status = state.modsCards.empty()
+            ? (query.empty() ? L"No installed user mods" : L"No installed mods match")
+            : std::to_wstring(state.modsCards.size()) + L" installed";
+        return;
+    }
+
+    const char* index = state.selectedModsTab == 1 ? "downloads" : "newest";
+    std::wstring error;
+    int total = 0;
+    if (!FetchModrinthMods(runtimeRoot, index, query, 0, kModPageSize, state.modsCards, total, error)) {
+        state.status = error.empty() ? L"Could not load Modrinth" : error;
+        state.isError = true;
+        return;
+    }
+
+    state.modsTotalHits = total;
+    state.modsExhausted = static_cast<int>(state.modsCards.size()) >= total;
+    QueueModIcons(state.modsCards);
+    state.status = state.modsCards.empty()
+        ? L"No mods found"
+        : std::to_wstring(state.modsCards.size()) + L" of " + std::to_wstring(total);
+}
+
+static winrt::Windows::UI::Core::CoreWindow g_modsCharWindow{nullptr};
+static winrt::event_token g_modsCharToken{};
+
+static void BeginModsSearchCapture(ICoreWindow* window) {
+    if (g_modsCharWindow) return;
+    try {
+        winrt::Windows::UI::Core::CoreWindow w{nullptr};
+        winrt::copy_from_abi(w, window);
+        g_modsCharToken = w.CharacterReceived(
+            [](winrt::Windows::UI::Core::CoreWindow const&,
+               winrt::Windows::UI::Core::CharacterReceivedEventArgs const& args) {
+                if (!g_modsSearchCapturing.load()) return;
+                const wchar_t ch = static_cast<wchar_t>(args.KeyCode());
+                std::lock_guard<std::mutex> lk(g_modsSearchMutex);
+                if (ch == 8) {
+                    if (!g_modsSearchBuffer.empty()) {
+                        g_modsSearchBuffer.pop_back();
+                        g_modsSearchDirty = true;
+                    }
+                } else if (ch >= 32 && ch != 127 && g_modsSearchBuffer.size() < 64) {
+                    g_modsSearchBuffer.push_back(ch);
+                    g_modsSearchDirty = true;
+                }
+            });
+        g_modsCharWindow = w;
+    } catch (...) {
+    }
+}
+
+static void EndModsSearchCapture() {
+    g_modsSearchCapturing.store(false);
+    if (g_modsCharWindow) {
+        try { g_modsCharWindow.CharacterReceived(g_modsCharToken); } catch (...) {}
+        g_modsCharWindow = nullptr;
+        g_modsCharToken = {};
+    }
+    std::lock_guard<std::mutex> lk(g_modsSearchMutex);
+    g_modsSearchBuffer.clear();
+    g_modsSearchDirty = false;
+}
+
+static void ShowModsPage(
+    ICoreWindow* window,
+    AuthScreenRenderer* renderer,
+    AuthUiState& state,
+    const std::wstring& runtimeRoot) {
+    const std::wstring userModsDir = runtimeRoot + L"\\game\\user-mods";
+    state.showMainMenu = false;
+    state.showModsPage = true;
+    state.title = L"Bandit Launcher";
+    state.selectedModsTab = 0;
+    state.selectedModIndex = 0;
+    state.modsFocus = 0;
+    state.modsScrollRow = 0;
+    state.modsSearchQuery.clear();
+    state.status = L"Loading installed mods";
+    LoadModsTab(state, runtimeRoot, userModsDir);
+
+    StartIconWorker();
+    BeginModsSearchCapture(window);
+    std::wstring loadedQuery = state.modsSearchQuery;
+
+    bool upWasDown = false;
+    bool downWasDown = false;
+    bool leftWasDown = false;
+    bool rightWasDown = false;
+    bool selectWasDown = false;
+    bool enterWasDown = false;
+    bool backWasDown = false;
+    bool pageUpWasDown = false;
+    bool pageDownWasDown = false;
+
+    auto enterSearch = [&]() {
+        std::lock_guard<std::mutex> lk(g_modsSearchMutex);
+        g_modsSearchBuffer = state.modsSearchQuery;
+        g_modsSearchDirty = false;
+        state.modsFocus = 1;
+    };
+
+    auto commitSearch = [&]() {
+        std::wstring buf;
+        {
+            std::lock_guard<std::mutex> lk(g_modsSearchMutex);
+            buf = g_modsSearchBuffer;
+        }
+        if (buf != loadedQuery) {
+            state.modsSearchQuery = buf;
+            LoadModsTab(state, runtimeRoot, userModsDir);
+            loadedQuery = buf;
+        }
+    };
+
+    auto ensureSelectionVisible = [&]() {
+        const int rowsVisible = g_modsRowsVisible.load();
+        const int selRow = state.selectedModIndex / 2;
+        if (selRow < state.modsScrollRow) state.modsScrollRow = selRow;
+        if (selRow >= state.modsScrollRow + rowsVisible) state.modsScrollRow = selRow - rowsVisible + 1;
+        if (state.modsScrollRow < 0) state.modsScrollRow = 0;
+    };
+
+    auto loadMore = [&]() {
+        if (state.modsExhausted || state.selectedModsTab == 0) return;
+        const char* index = state.selectedModsTab == 1 ? "downloads" : "newest";
+        const int before = static_cast<int>(state.modsCards.size());
+        state.status = L"Loading more...";
+        RenderAuth(renderer, state);
+
+        int total = state.modsTotalHits;
+        std::wstring error;
+        if (!FetchModrinthMods(runtimeRoot, index, state.modsSearchQuery, before, kModPageSize, state.modsCards, total, error)) {
+            state.modsExhausted = true;
+            return;
+        }
+        const int after = static_cast<int>(state.modsCards.size());
+        state.modsTotalHits = total;
+        state.modsExhausted = after == before || after >= total;
+        QueueModIconsAppend(state.modsCards, static_cast<size_t>(before));
+        state.status = std::to_wstring(after) + L" of " + std::to_wstring(total);
+    };
+
+    WriteLog(L"Mods page opened");
+    while (true) {
+        g_modsSearchCapturing.store(state.modsFocus == 1);
+        if (state.modsFocus == 1) {
+            std::lock_guard<std::mutex> lk(g_modsSearchMutex);
+            state.modsSearchQuery = g_modsSearchBuffer;
+        }
+
+        state.animation = static_cast<float>((GetTickCount64() % 100000) / 1000.0);
+        RenderAuth(renderer, state);
+
+        const bool upDown = AnyVirtualKeyDown(window, {
+            ABI::Windows::System::VirtualKey_Up,
+            ABI::Windows::System::VirtualKey_GamepadDPadUp,
+            ABI::Windows::System::VirtualKey_GamepadLeftThumbstickUp
+        });
+        const bool downDown = AnyVirtualKeyDown(window, {
+            ABI::Windows::System::VirtualKey_Down,
+            ABI::Windows::System::VirtualKey_GamepadDPadDown,
+            ABI::Windows::System::VirtualKey_GamepadLeftThumbstickDown
+        });
+        const bool leftDown = AnyVirtualKeyDown(window, {
+            ABI::Windows::System::VirtualKey_Left,
+            ABI::Windows::System::VirtualKey_GamepadDPadLeft,
+            ABI::Windows::System::VirtualKey_GamepadLeftThumbstickLeft
+        });
+        const bool rightDown = AnyVirtualKeyDown(window, {
+            ABI::Windows::System::VirtualKey_Right,
+            ABI::Windows::System::VirtualKey_GamepadDPadRight,
+            ABI::Windows::System::VirtualKey_GamepadLeftThumbstickRight
+        });
+        const bool selectDown = AnyVirtualKeyDown(window, {
+            ABI::Windows::System::VirtualKey_Enter,
+            ABI::Windows::System::VirtualKey_Space,
+            ABI::Windows::System::VirtualKey_GamepadA
+        });
+        const bool enterDown = AnyVirtualKeyDown(window, {
+            ABI::Windows::System::VirtualKey_Enter,
+            ABI::Windows::System::VirtualKey_GamepadA
+        });
+        const bool backDown = AnyVirtualKeyDown(window, {
+            ABI::Windows::System::VirtualKey_Escape,
+            ABI::Windows::System::VirtualKey_GamepadB
+        });
+        const bool pageUpDown = AnyVirtualKeyDown(window, {
+            ABI::Windows::System::VirtualKey_PageUp,
+            ABI::Windows::System::VirtualKey_GamepadLeftShoulder
+        });
+        const bool pageDownDown = AnyVirtualKeyDown(window, {
+            ABI::Windows::System::VirtualKey_PageDown,
+            ABI::Windows::System::VirtualKey_GamepadRightShoulder
+        });
+
+        if (backDown && !backWasDown) {
+            WriteLog(L"Mods page closed");
+            EndModsSearchCapture();
+            StopIconWorker();
+            state.showModsPage = false;
+            state.showMainMenu = true;
+            state.modsCards.clear();
+            state.isError = false;
+            return;
+        }
+
+        const int count = static_cast<int>(state.modsCards.size());
+
+        if (state.modsFocus == 0) {
+            if (upDown && !upWasDown) {
+                state.selectedModsTab = (state.selectedModsTab + 2) % 3;
+                LoadModsTab(state, runtimeRoot, userModsDir);
+                loadedQuery = state.modsSearchQuery;
+            }
+            if (downDown && !downWasDown) {
+                state.selectedModsTab = (state.selectedModsTab + 1) % 3;
+                LoadModsTab(state, runtimeRoot, userModsDir);
+                loadedQuery = state.modsSearchQuery;
+            }
+            if ((rightDown && !rightWasDown) || (selectDown && !selectWasDown)) {
+                enterSearch();
+            }
+        } else if (state.modsFocus == 1) {
+            if (enterDown && !enterWasDown) {
+                commitSearch();
+                state.modsFocus = state.modsCards.empty() ? 1 : 2;
+                state.selectedModIndex = 0;
+                state.modsScrollRow = 0;
+            }
+            if (upDown && !upWasDown) {
+                commitSearch();
+                state.modsFocus = 0;
+            }
+            if ((leftDown && !leftWasDown)) {
+                commitSearch();
+                state.modsFocus = 0;
+            }
+            if (downDown && !downWasDown) {
+                commitSearch();
+                if (!state.modsCards.empty()) {
+                    state.modsFocus = 2;
+                    state.selectedModIndex = 0;
+                    state.modsScrollRow = 0;
+                } else {
+                    state.modsFocus = 0;
+                }
+            }
+        } else {
+            if (leftDown && !leftWasDown) {
+                if (state.selectedModIndex % 2 == 0) {
+                    state.modsFocus = 0;
+                } else {
+                    --state.selectedModIndex;
+                }
+            }
+            if (rightDown && !rightWasDown && state.selectedModIndex + 1 < count) {
+                ++state.selectedModIndex;
+            }
+            if (upDown && !upWasDown) {
+                if (state.selectedModIndex < 2) {
+                    enterSearch();
+                } else {
+                    state.selectedModIndex -= 2;
+                }
+            }
+            if (downDown && !downWasDown && state.selectedModIndex + 2 < count) {
+                state.selectedModIndex += 2;
+            }
+            if (pageDownDown && !pageDownWasDown && count > 0) {
+                const int step = g_modsRowsVisible.load() * 2;
+                state.selectedModIndex = (std::min)(state.selectedModIndex + step, count - 1);
+            }
+            if (pageUpDown && !pageUpWasDown) {
+                const int step = g_modsRowsVisible.load() * 2;
+                state.selectedModIndex = (std::max)(state.selectedModIndex - step, 0);
+            }
+
+            if (!state.modsExhausted && state.selectedModsTab != 0 && count > 0 &&
+                ((downDown && !downWasDown) || (pageDownDown && !pageDownWasDown))) {
+                const int lastRow = (count - 1) / 2;
+                if (state.selectedModIndex / 2 >= lastRow) {
+                    loadMore();
+                }
+            }
+
+            if (state.modsFocus == 2) {
+                ensureSelectionVisible();
+            }
+
+            if (selectDown && !selectWasDown && state.selectedModIndex >= 0 && state.selectedModIndex < count) {
+                ModCard selected = state.modsCards[static_cast<size_t>(state.selectedModIndex)];
+                if (state.selectedModsTab == 0) {
+                    if (!selected.filePath.empty()) {
+                        WriteLogF(L"Deleting installed mod %s", selected.filePath.c_str());
+                        DeleteFileW(selected.filePath.c_str());
+                        DeleteFileW(ModMetaPath(runtimeRoot, selected.filePath.substr(selected.filePath.find_last_of(L'\\') + 1)).c_str());
+                    }
+                    LoadModsTab(state, runtimeRoot, userModsDir);
+                    loadedQuery = state.modsSearchQuery;
+                    if (state.selectedModIndex >= static_cast<int>(state.modsCards.size())) {
+                        state.selectedModIndex = (std::max)(0, static_cast<int>(state.modsCards.size()) - 1);
+                    }
+                    if (state.modsCards.empty()) state.modsFocus = 0;
+                    ensureSelectionVisible();
+                } else {
+                    state.status = L"Installing " + selected.title;
+                    state.isError = false;
+                    RenderAuth(renderer, state);
+
+                    std::vector<std::wstring> installed;
+                    std::wstring error;
+                    if (InstallModrinthProject(selected, runtimeRoot, userModsDir, installed, error)) {
+                        state.status = installed.empty()
+                            ? L"Already installed"
+                            : L"Installed " + std::to_wstring(installed.size()) + L" file(s)";
+                        state.isError = false;
+                    } else {
+                        state.status = error.empty() ? L"Install failed" : error;
+                        state.isError = true;
+                    }
+                }
+            }
+        }
+
+        upWasDown = upDown;
+        downWasDown = downDown;
+        leftWasDown = leftDown;
+        rightWasDown = rightDown;
+        selectWasDown = selectDown;
+        enterWasDown = enterDown;
+        backWasDown = backDown;
+        pageUpWasDown = pageUpDown;
+        pageDownWasDown = pageDownDown;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
+static MainMenuAction ShowMainMenu(ICoreWindow* window, const LaunchAuthConfig& authConfig, const std::wstring& runtimeRoot) {
     AuthScreenRenderer rendererInstance;
     AuthScreenRenderer* renderer = nullptr;
     if (rendererInstance.Initialize(window)) {
@@ -2551,8 +3641,9 @@ static MainMenuAction ShowMainMenu(ICoreWindow* window, const LaunchAuthConfig& 
                 return MainMenuAction::Play;
             }
             if (selected == 1) {
-                WriteLog(L"Main menu: Mods placeholder selected");
-                state.detail = L"Mods are not implemented yet.";
+                WriteLog(L"Main menu: Mods selected");
+                ShowModsPage(window, renderer, state, runtimeRoot);
+                state.detail = L"Browse installed, popular, and latest Fabric mods.";
             } else if (selected == 2) {
                 WriteLog(L"Main menu: Repair downloads selected");
                 state.status = L"Repairing downloaded files";
@@ -3636,7 +4727,7 @@ public:
                 return E_FAIL;
             }
 
-            const MainMenuAction menuAction = ShowMainMenu(g_authWindow.Get(), authConfig);
+            const MainMenuAction menuAction = ShowMainMenu(g_authWindow.Get(), authConfig, exeDir);
             if (menuAction == MainMenuAction::Play) {
                 break;
             }
