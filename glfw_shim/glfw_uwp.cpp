@@ -16,12 +16,14 @@
 #include <GameInput.h>
 #include <windows.system.h>
 #include <windows.ui.core.h>
+#include <windows.graphics.display.h>
 
 using namespace Microsoft::WRL;
 using namespace Microsoft::WRL::Wrappers;
 using namespace ABI::Windows::ApplicationModel::Core;
 using namespace ABI::Windows::Foundation;
 using namespace ABI::Windows::Foundation::Collections;
+using namespace ABI::Windows::Graphics::Display;
 using namespace ABI::Windows::System;
 using namespace ABI::Windows::UI::Core;
 
@@ -291,8 +293,12 @@ static HMODULE g_libGLESv2 = NULL;
 static BOOL g_graphicsRuntimeUsesGles = FALSE;
 static BOOL g_initialised = FALSE;
 static BOOL g_should_close = FALSE;
-static int g_width = 1920;
-static int g_height = 1080;
+static int g_window_width = 1920;
+static int g_window_height = 1080;
+static int g_framebuffer_width = 1920;
+static int g_framebuffer_height = 1080;
+static float g_content_scale_x = 1.0f;
+static float g_content_scale_y = 1.0f;
 static int g_swap_log_count = 0;
 static int g_poll_log_count = 0;
 static int g_proc_log_count = 0;
@@ -914,27 +920,105 @@ static bool AcquireCoreWindow() {
     return true;
 }
 
+static int ScaleDimensionToPixels(FLOAT value, double scale, int fallback) {
+    if (value <= 0.0f) return fallback;
+    if (scale <= 0.0) scale = 1.0;
+    const double scaled = (double)value * scale;
+    return scaled > 0.0 ? (int)(scaled + 0.5) : fallback;
+}
+
+static void GetDisplayScale(double& scaleX, double& scaleY) {
+    scaleX = 1.0;
+    scaleY = 1.0;
+
+    wchar_t envScale[32] = {};
+    DWORD envLen = GetEnvironmentVariableW(
+        L"MC_RAW_PIXELS_PER_VIEW_PIXEL",
+        envScale,
+        (DWORD)(sizeof(envScale) / sizeof(envScale[0])));
+    if (envLen > 0 && envLen < (DWORD)(sizeof(envScale) / sizeof(envScale[0]))) {
+        wchar_t* end = nullptr;
+        const double value = wcstod(envScale, &end);
+        if (value >= 0.5 && value <= 8.0) {
+            scaleX = value;
+            scaleY = value;
+            return;
+        }
+    }
+
+    ComPtr<IDisplayInformationStatics> displayStatics;
+    HRESULT hr = GetActivationFactory(
+        HStringReference(RuntimeClass_Windows_Graphics_Display_DisplayInformation).Get(),
+        &displayStatics);
+    if (FAILED(hr)) return;
+
+    ComPtr<IDisplayInformation> displayInfo;
+    hr = displayStatics->GetForCurrentView(displayInfo.GetAddressOf());
+    if (FAILED(hr) || !displayInfo) return;
+
+    ComPtr<IDisplayInformation2> displayInfo2;
+    if (SUCCEEDED(displayInfo.As(&displayInfo2)) && displayInfo2) {
+        DOUBLE rawPixelsPerViewPixel = 1.0;
+        if (SUCCEEDED(displayInfo2->get_RawPixelsPerViewPixel(&rawPixelsPerViewPixel)) &&
+            rawPixelsPerViewPixel > 0.0) {
+            scaleX = rawPixelsPerViewPixel;
+            scaleY = rawPixelsPerViewPixel;
+            return;
+        }
+    }
+
+    FLOAT logicalDpi = 96.0f;
+    if (SUCCEEDED(displayInfo->get_LogicalDpi(&logicalDpi)) && logicalDpi > 0.0f) {
+        scaleX = logicalDpi / 96.0;
+        scaleY = logicalDpi / 96.0;
+    }
+}
+
 static void RefreshWindowMetrics(bool fireCallbacks) {
     if (!AcquireCoreWindow()) return;
 
     Rect bounds = {};
     if (FAILED(g_coreWindow->get_Bounds(&bounds))) return;
 
-    const int newWidth = bounds.Width > 0 ? (int)bounds.Width : g_width;
-    const int newHeight = bounds.Height > 0 ? (int)bounds.Height : g_height;
-    if (newWidth == g_width && newHeight == g_height) return;
+    double scaleX = 1.0;
+    double scaleY = 1.0;
+    GetDisplayScale(scaleX, scaleY);
 
-    g_width = newWidth;
-    g_height = newHeight;
-    g_vidmode.width = g_width;
-    g_vidmode.height = g_height;
-    g_fake_window.width = g_width;
-    g_fake_window.height = g_height;
-    ShimLog("Window size %dx%d", g_width, g_height);
+    const int newWindowWidth = bounds.Width > 0 ? (int)(bounds.Width + 0.5f) : g_window_width;
+    const int newWindowHeight = bounds.Height > 0 ? (int)(bounds.Height + 0.5f) : g_window_height;
+    const int newFramebufferWidth = ScaleDimensionToPixels(bounds.Width, scaleX, g_framebuffer_width);
+    const int newFramebufferHeight = ScaleDimensionToPixels(bounds.Height, scaleY, g_framebuffer_height);
+    const float newContentScaleX = (float)scaleX;
+    const float newContentScaleY = (float)scaleY;
+
+    if (newWindowWidth == g_window_width &&
+        newWindowHeight == g_window_height &&
+        newFramebufferWidth == g_framebuffer_width &&
+        newFramebufferHeight == g_framebuffer_height &&
+        newContentScaleX == g_content_scale_x &&
+        newContentScaleY == g_content_scale_y) {
+        return;
+    }
+
+    g_window_width = newWindowWidth;
+    g_window_height = newWindowHeight;
+    g_framebuffer_width = newFramebufferWidth;
+    g_framebuffer_height = newFramebufferHeight;
+    g_content_scale_x = newContentScaleX;
+    g_content_scale_y = newContentScaleY;
+    g_vidmode.width = g_framebuffer_width;
+    g_vidmode.height = g_framebuffer_height;
+    g_fake_window.width = g_window_width;
+    g_fake_window.height = g_window_height;
+    ShimLog("Window size %dx%d, framebuffer %dx%d, scale %.3fx%.3f",
+        g_window_width, g_window_height,
+        g_framebuffer_width, g_framebuffer_height,
+        g_content_scale_x, g_content_scale_y);
 
     if (fireCallbacks) {
-        if (g_winsize_cb) g_winsize_cb((GLFWwindow*)&g_fake_window, g_width, g_height);
-        if (g_fbsize_cb) g_fbsize_cb((GLFWwindow*)&g_fake_window, g_width, g_height);
+        if (g_winsize_cb) g_winsize_cb((GLFWwindow*)&g_fake_window, g_window_width, g_window_height);
+        if (g_fbsize_cb) g_fbsize_cb((GLFWwindow*)&g_fake_window, g_framebuffer_width, g_framebuffer_height);
+        if (g_contentscale_cb) g_contentscale_cb((GLFWwindow*)&g_fake_window, g_content_scale_x, g_content_scale_y);
     }
 }
 
@@ -991,8 +1075,8 @@ static bool BuildNativeWindowPropertySet() {
     }
 
     Size size = {};
-    size.Width = (FLOAT)g_width;
-    size.Height = (FLOAT)g_height;
+    size.Width = (FLOAT)g_framebuffer_width;
+    size.Height = (FLOAT)g_framebuffer_height;
 
     ComPtr<IInspectable> sizeInspectable;
     hr = propertyValueStatics->CreateSize(size, sizeInspectable.GetAddressOf());
@@ -1008,7 +1092,8 @@ static bool BuildNativeWindowPropertySet() {
     }
 
     propertySet.As(&g_nativeWindowPropertySet);
-    ShimLog("Created EGL PropertySet surface descriptor (%dx%d)", g_width, g_height);
+    ShimLog("Created EGL PropertySet surface descriptor (%dx%d)",
+        g_framebuffer_width, g_framebuffer_height);
     return true;
 }
 
@@ -1151,7 +1236,8 @@ static bool CreateEglContext() {
         return false;
     }
 
-    // Prefer the raw CoreWindow for Mesa's UWP EGL backend.
+    // The raw CoreWindow path is the stable Mesa UWP path. The PropertySet path
+    // can report success but present a black surface on Xbox.
     g_eglSurface = p_eglCreateWindowSurface(g_eglDisplay, g_eglConfig,
         reinterpret_cast<EGLNativeWindowType>(g_coreWindow.Get()), nullptr);
     if (g_eglSurface != EGL_NO_SURFACE) {
@@ -1181,7 +1267,8 @@ static bool CreateEglContext() {
             ReportEglError("eglCreateWindowSurface(PropertySet)");
         }
     }
-    if (g_eglSurface == EGL_NO_SURFACE && p_eglCreatePlatformWindowSurface) {
+
+    if (g_eglSurface == EGL_NO_SURFACE && g_nativeWindowPropertySet && p_eglCreatePlatformWindowSurface) {
         g_eglSurface = p_eglCreatePlatformWindowSurface(g_eglDisplay, g_eglConfig,
             g_nativeWindowPropertySet.Get(), nullptr);
         if (g_eglSurface != EGL_NO_SURFACE) {
@@ -1190,6 +1277,7 @@ static bool CreateEglContext() {
             ReportEglError("eglCreatePlatformWindowSurface(PropertySet)");
         }
     }
+
     if (g_eglSurface == EGL_NO_SURFACE) {
         return false;
     }
@@ -1248,9 +1336,11 @@ extern "C" __declspec(dllexport) int glfwInit(void) {
     if (g_initialised) return GLFW_TRUE;
     if (!AcquireCoreWindow()) return GLFW_FALSE;
     RefreshWindowMetrics(false);
-    g_fake_window = {0x58574C47u, g_width, g_height, FALSE, NULL};
+    g_fake_window = {0x58574C47u, g_window_width, g_window_height, FALSE, NULL};
     g_initialised = TRUE;
-    ShimLog("glfwInit OK %dx%d", g_width, g_height);
+    ShimLog("glfwInit OK window %dx%d framebuffer %dx%d",
+        g_window_width, g_window_height,
+        g_framebuffer_width, g_framebuffer_height);
     return GLFW_TRUE;
 }
 
@@ -1313,19 +1403,25 @@ GLFWwindow* glfwCreateWindow(int w, int h, const char* title, GLFWmonitor*, GLFW
     ShimLog("glfwCreateWindow %dx%d '%s'", w, h, title ? title : "");
     if (!g_initialised && !glfwInit()) return NULL;
 
-    if (w > 0) g_width = w;
-    if (h > 0) g_height = h;
+    if (w > 0) {
+        g_window_width = w;
+        g_framebuffer_width = ScaleDimensionToPixels((FLOAT)w, g_content_scale_x, g_framebuffer_width);
+    }
+    if (h > 0) {
+        g_window_height = h;
+        g_framebuffer_height = ScaleDimensionToPixels((FLOAT)h, g_content_scale_y, g_framebuffer_height);
+    }
     RefreshWindowMetrics(false);
     if (!CreateEglContext()) {
         ShimLog("CreateEglContext FAILED");
         return NULL;
     }
 
-    g_fake_window.width = g_width;
-    g_fake_window.height = g_height;
-    g_vidmode.width = g_width;
-    g_vidmode.height = g_height;
-    if (g_fbsize_cb) g_fbsize_cb((GLFWwindow*)&g_fake_window, g_width, g_height);
+    g_fake_window.width = g_window_width;
+    g_fake_window.height = g_window_height;
+    g_vidmode.width = g_framebuffer_width;
+    g_vidmode.height = g_framebuffer_height;
+    if (g_fbsize_cb) g_fbsize_cb((GLFWwindow*)&g_fake_window, g_framebuffer_width, g_framebuffer_height);
     ShimLog("glfwCreateWindow OK");
     return (GLFWwindow*)&g_fake_window;
 }
@@ -1340,16 +1436,17 @@ extern "C" __declspec(dllexport) void glfwSetWindowTitle(GLFWwindow*, const char
 extern "C" __declspec(dllexport) void glfwSetWindowIcon(GLFWwindow*, int, const GLFWimage*) {}
 extern "C" __declspec(dllexport) void glfwGetWindowPos(GLFWwindow*, int*x, int*y) { if(x)*x=0; if(y)*y=0; }
 extern "C" __declspec(dllexport) void glfwSetWindowPos(GLFWwindow*, int, int) {}
-extern "C" __declspec(dllexport) void glfwGetWindowSize(GLFWwindow*, int*w, int*h) { RefreshWindowMetrics(false); if(w)*w=g_width; if(h)*h=g_height; }
+extern "C" __declspec(dllexport) void glfwGetWindowSize(GLFWwindow*, int*w, int*h) { RefreshWindowMetrics(false); if(w)*w=g_window_width; if(h)*h=g_window_height; }
 extern "C" __declspec(dllexport) void glfwSetWindowSizeLimits(GLFWwindow*, int, int, int, int) {}
 extern "C" __declspec(dllexport) void glfwSetWindowAspectRatio(GLFWwindow*, int, int) {}
 extern "C" __declspec(dllexport) void glfwSetWindowSize(GLFWwindow*, int, int) {}
-extern "C" __declspec(dllexport) void glfwGetFramebufferSize(GLFWwindow*, int*w, int*h) { RefreshWindowMetrics(false); if(w)*w=g_width; if(h)*h=g_height; }
+extern "C" __declspec(dllexport) void glfwGetFramebufferSize(GLFWwindow*, int*w, int*h) { RefreshWindowMetrics(false); if(w)*w=g_framebuffer_width; if(h)*h=g_framebuffer_height; }
 extern "C" __declspec(dllexport) void glfwGetWindowFrameSize(GLFWwindow*, int*l, int*t, int*r, int*b) {
     if(l)*l=0; if(t)*t=0; if(r)*r=0; if(b)*b=0;
 }
 extern "C" __declspec(dllexport) void glfwGetWindowContentScale(GLFWwindow*, float*x, float*y) {
-    if(x)*x=1.f; if(y)*y=1.f;
+    RefreshWindowMetrics(false);
+    if(x)*x=g_content_scale_x; if(y)*y=g_content_scale_y;
 }
 extern "C" __declspec(dllexport) float glfwGetWindowOpacity(GLFWwindow*) { return 1.f; }
 extern "C" __declspec(dllexport) void  glfwSetWindowOpacity(GLFWwindow*, float) {}
@@ -1620,10 +1717,14 @@ extern "C" __declspec(dllexport) GLFWmonitor** glfwGetMonitors(int*c) {
 extern "C" __declspec(dllexport) GLFWmonitor* glfwGetPrimaryMonitor(void) { return (GLFWmonitor*)1; }
 extern "C" __declspec(dllexport) void glfwGetMonitorPos(GLFWmonitor*, int*x, int*y) { if(x)*x=0; if(y)*y=0; }
 extern "C" __declspec(dllexport) void glfwGetMonitorWorkarea(GLFWmonitor*, int*x, int*y, int*w, int*h) {
-    if(x)*x=0; if(y)*y=0; if(w)*w=g_width; if(h)*h=g_height;
+    RefreshWindowMetrics(false);
+    if(x)*x=0; if(y)*y=0; if(w)*w=g_framebuffer_width; if(h)*h=g_framebuffer_height;
 }
 extern "C" __declspec(dllexport) void glfwGetMonitorPhysicalSize(GLFWmonitor*, int*w, int*h) { if(w)*w=527; if(h)*h=296; }
-extern "C" __declspec(dllexport) void glfwGetMonitorContentScale(GLFWmonitor*, float*x, float*y) { if(x)*x=1.f; if(y)*y=1.f; }
+extern "C" __declspec(dllexport) void glfwGetMonitorContentScale(GLFWmonitor*, float*x, float*y) {
+    RefreshWindowMetrics(false);
+    if(x)*x=g_content_scale_x; if(y)*y=g_content_scale_y;
+}
 extern "C" __declspec(dllexport) const char* glfwGetMonitorName(GLFWmonitor*) { return "CoreWindow Display"; }
 extern "C" __declspec(dllexport) void  glfwSetMonitorUserPointer(GLFWmonitor*, void*) {}
 extern "C" __declspec(dllexport) void* glfwGetMonitorUserPointer(GLFWmonitor*) { return NULL; }

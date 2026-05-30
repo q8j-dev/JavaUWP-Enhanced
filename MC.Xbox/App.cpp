@@ -43,6 +43,7 @@
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Graphics.Display.h>
 #include <winrt/Windows.Security.Credentials.h>
 #include <winrt/Windows.Security.ExchangeActiveSyncProvisioning.h>
 #include <winrt/Windows.Storage.Streams.h>
@@ -4953,6 +4954,21 @@ public:
             g_logDir = GetExecutableDir();
         }
         EnsureDirectoryTree(g_logDir);
+
+        try {
+            const double rawPixelsPerViewPixel =
+                winrt::Windows::Graphics::Display::DisplayInformation::GetForCurrentView()
+                    .RawPixelsPerViewPixel();
+            if (rawPixelsPerViewPixel >= 0.5 && rawPixelsPerViewPixel <= 8.0) {
+                wchar_t scaleText[32] = {};
+                swprintf_s(scaleText, L"%.6f", rawPixelsPerViewPixel);
+                SetEnvironmentVariableW(L"MC_RAW_PIXELS_PER_VIEW_PIXEL", scaleText);
+                WriteLogF(L"SetWindow: rawPixelsPerViewPixel=%s", scaleText);
+            }
+        } catch (const winrt::hresult_error& ex) {
+            WriteLogF(L"SetWindow: DisplayInformation scale unavailable hr=0x%08X msg=%s",
+                static_cast<unsigned int>(ex.code()), ex.message().c_str());
+        }
 
         // On Xbox, the B button is also treated as a UWP Back request. If it is
         // not handled here, the shell can suspend/back out of the app before the
