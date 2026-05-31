@@ -5095,17 +5095,10 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     vmOptionStorage.reserve(16);
     vmOptionStorage.push_back("-Xmx4G");
     vmOptionStorage.push_back("-Xms4G");
-    // ZGC: concurrent GC with <1ms pauses. Generational is default in Java 23+.
     vmOptionStorage.push_back("-XX:+UseZGC");
-    vmOptionStorage.push_back("-XX:SoftMaxHeapSize=3500m");   // soft GC trigger, keeps 500m headroom
-    vmOptionStorage.push_back("-XX:ZUncommitDelay=60");        // return unused pages after 60s idle
-    vmOptionStorage.push_back("-XX:+DisableExplicitGC");       // ignore System.gc() calls from mods/MC
-    // AlwaysPreTouch omitted: pre-faulting 4GB at startup kills the process in Xbox UWP sandbox
-    // PerfDisableSharedMem omitted: shared memory perf counters may not exist in UWP; flag can crash JVM init
-    vmOptionStorage.push_back("-XX:CICompilerCount=2");        // 2 JIT threads; frees cores for chunk builders
+    vmOptionStorage.push_back("-XX:+DisableExplicitGC");
+    vmOptionStorage.push_back("-XX:CICompilerCount=2");
     vmOptionStorage.push_back("-XX:ReservedCodeCacheSize=512m");
-    vmOptionStorage.push_back("-XX:+OptimizeStringConcat");
-    vmOptionStorage.push_back("-XX:+UseCompressedOops");
     vmOptionStorage.push_back("--enable-native-access=ALL-UNNAMED");
     vmOptionStorage.push_back("--add-opens=jdk.zipfs/jdk.nio.zipfs=ALL-UNNAMED");
     const std::wstring localJavaSecurityPatch = exeDir + L"\\java-base-security-realpath.jar";
