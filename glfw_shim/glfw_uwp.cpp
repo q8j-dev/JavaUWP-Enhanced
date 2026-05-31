@@ -247,6 +247,8 @@ typedef uint32_t EGLenum;
 #define EGL_OPENGL_ES3_BIT_KHR 0x00000040
 #define EGL_OPENGL_API 0x30A2
 #define EGL_OPENGL_ES_API 0x30A0
+#define EGL_WIDTH  0x3057
+#define EGL_HEIGHT 0x3056
 #define EGL_VENDOR 0x3053
 #define EGL_VERSION 0x3054
 #define EGL_CONTEXT_CLIENT_VERSION 0x3098
@@ -269,6 +271,7 @@ typedef EGLBoolean (WINAPI* PFN_eglDestroySurface)(EGLDisplay, EGLSurface);
 typedef EGLBoolean (WINAPI* PFN_eglMakeCurrent)(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
 typedef EGLBoolean (WINAPI* PFN_eglSwapBuffers)(EGLDisplay, EGLSurface);
 typedef EGLBoolean (WINAPI* PFN_eglSwapInterval)(EGLDisplay, EGLint);
+typedef EGLBoolean (WINAPI* PFN_eglQuerySurface)(EGLDisplay, EGLSurface, EGLint, EGLint*);
 typedef const char* (WINAPI* PFN_eglQueryString)(EGLDisplay, EGLint);
 typedef void* (WINAPI* PFN_eglGetProcAddress)(const char*);
 typedef EGLint (WINAPI* PFN_eglGetError)(void);
@@ -328,6 +331,7 @@ static PFN_eglDestroySurface p_eglDestroySurface = nullptr;
 static PFN_eglMakeCurrent p_eglMakeCurrent = nullptr;
 static PFN_eglSwapBuffers p_eglSwapBuffers = nullptr;
 static PFN_eglSwapInterval p_eglSwapInterval = nullptr;
+static PFN_eglQuerySurface p_eglQuerySurface = nullptr;
 static PFN_eglQueryString p_eglQueryString = nullptr;
 static PFN_eglGetProcAddress p_eglGetProcAddress = nullptr;
 static PFN_eglGetError p_eglGetError = nullptr;
@@ -1212,6 +1216,7 @@ static bool LoadMesaEGL() {
     p_eglMakeCurrent = (PFN_eglMakeCurrent)ResolveProc(g_libEGL, "eglMakeCurrent");
     p_eglSwapBuffers = (PFN_eglSwapBuffers)ResolveProc(g_libEGL, "eglSwapBuffers");
     p_eglSwapInterval = (PFN_eglSwapInterval)ResolveProc(g_libEGL, "eglSwapInterval");
+    p_eglQuerySurface = (PFN_eglQuerySurface)ResolveProc(g_libEGL, "eglQuerySurface");
     p_eglQueryString = (PFN_eglQueryString)ResolveProc(g_libEGL, "eglQueryString");
     p_eglGetProcAddress = (PFN_eglGetProcAddress)ResolveProc(g_libEGL, "eglGetProcAddress");
     p_eglGetError = (PFN_eglGetError)ResolveProc(g_libEGL, "eglGetError");
@@ -1339,6 +1344,23 @@ static bool CreateEglContext() {
 
     if (g_eglSurface == EGL_NO_SURFACE) {
         return false;
+    }
+
+    if (p_eglQuerySurface) {
+        EGLint surfW = 0, surfH = 0;
+        if (p_eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_WIDTH, &surfW) &&
+            p_eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_HEIGHT, &surfH) &&
+            surfW > 0 && surfH > 0) {
+            ShimLog("EGL surface pixel size from query: %dx%d (was framebuffer %dx%d)",
+                surfW, surfH, g_framebuffer_width, g_framebuffer_height);
+            g_framebuffer_width = surfW;
+            g_framebuffer_height = surfH;
+            g_vidmode.width = surfW;
+            g_vidmode.height = surfH;
+        } else {
+            ShimLog("eglQuerySurface failed, keeping framebuffer %dx%d",
+                g_framebuffer_width, g_framebuffer_height);
+        }
     }
 
     const EGLint desktopContextAttrs[] = {
@@ -1476,6 +1498,7 @@ GLFWwindow* glfwCreateWindow(int w, int h, const char* title, GLFWmonitor*, GLFW
     g_fake_window.height = g_window_height;
     g_vidmode.width = g_framebuffer_width;
     g_vidmode.height = g_framebuffer_height;
+    if (g_winsize_cb) g_winsize_cb((GLFWwindow*)&g_fake_window, g_window_width, g_window_height);
     if (g_fbsize_cb) g_fbsize_cb((GLFWwindow*)&g_fake_window, g_framebuffer_width, g_framebuffer_height);
     ShimLog("glfwCreateWindow OK");
     return (GLFWwindow*)&g_fake_window;
