@@ -56,11 +56,18 @@ jobs:
         shell: powershell
         run: .\scripts\clean.ps1 -Apply
 
-      - name: Restore Fabric remap cache
+      - name: Restore build cache
         uses: actions/cache@v4
         with:
-          path: staging/cache/gameDir/.fabric/remappedJars
-          key: fabric-remap-${{ runner.os }}-${{ hashFiles('scripts/config.ps1') }}
+          path: |
+            staging/cache/gameDir/.fabric/remappedJars
+            staging/cache/gameDir/libraries
+            staging/cache/gameDir/versions
+            staging/cache/natives-1.21
+            staging/cache/tools
+          key: build-cache-${{ runner.os }}-${{ hashFiles('scripts/config.ps1') }}
+          restore-keys: |
+            build-cache-${{ runner.os }}-
 
       - name: Prepare build cache
         shell: powershell
