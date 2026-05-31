@@ -293,10 +293,10 @@ static HMODULE g_libGLESv2 = NULL;
 static BOOL g_graphicsRuntimeUsesGles = FALSE;
 static BOOL g_initialised = FALSE;
 static BOOL g_should_close = FALSE;
-static int g_window_width = 1920;
-static int g_window_height = 1080;
-static int g_framebuffer_width = 1920;
-static int g_framebuffer_height = 1080;
+static int g_window_width = 0;
+static int g_window_height = 0;
+static int g_framebuffer_width = 0;
+static int g_framebuffer_height = 0;
 static float g_content_scale_x = 1.0f;
 static float g_content_scale_y = 1.0f;
 static int g_swap_log_count = 0;
@@ -381,7 +381,7 @@ struct FakeWindow {
     void* user_pointer;
 };
 static FakeWindow g_fake_window;
-static GLFWvidmode g_vidmode = {1920,1080,8,8,8,60};
+static GLFWvidmode g_vidmode = {0,0,8,8,8,60}; // width/height filled in by RefreshWindowMetrics
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -1335,6 +1335,12 @@ extern "C" __declspec(dllexport) int glfwInit(void) {
     ShimLog("glfwInit");
     if (g_initialised) return GLFW_TRUE;
     if (!AcquireCoreWindow()) return GLFW_FALSE;
+    // Reset to zero so RefreshWindowMetrics always applies the real CoreWindow
+    // bounds on first call, even if they happen to match the 1920x1080 defaults.
+    g_window_width = 0;
+    g_window_height = 0;
+    g_framebuffer_width = 0;
+    g_framebuffer_height = 0;
     RefreshWindowMetrics(false);
     g_fake_window = {0x58574C47u, g_window_width, g_window_height, FALSE, NULL};
     g_initialised = TRUE;
@@ -1400,17 +1406,13 @@ extern "C" __declspec(dllexport) void glfwWindowHintString(int,const char*) {}
 
 extern "C" __declspec(dllexport)
 GLFWwindow* glfwCreateWindow(int w, int h, const char* title, GLFWmonitor*, GLFWwindow*) {
-    ShimLog("glfwCreateWindow %dx%d '%s'", w, h, title ? title : "");
+    ShimLog("glfwCreateWindow requested %dx%d '%s' (ignored; using CoreWindow bounds)", w, h, title ? title : "");
     if (!g_initialised && !glfwInit()) return NULL;
 
-    if (w > 0) {
-        g_window_width = w;
-        g_framebuffer_width = ScaleDimensionToPixels((FLOAT)w, g_content_scale_x, g_framebuffer_width);
-    }
-    if (h > 0) {
-        g_window_height = h;
-        g_framebuffer_height = ScaleDimensionToPixels((FLOAT)h, g_content_scale_y, g_framebuffer_height);
-    }
+    // Always derive the actual window size from CoreWindow bounds.
+    // Minecraft passes a hardcoded resolution (e.g. 1920x1080) here which we
+    // intentionally discard so the game fills the real display at whatever
+    // resolution the Xbox is currently running at.
     RefreshWindowMetrics(false);
     if (!CreateEglContext()) {
         ShimLog("CreateEglContext FAILED");
