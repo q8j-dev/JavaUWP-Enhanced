@@ -9,7 +9,8 @@
     "SystemDetailsOshiBypassMixin",
     "WorldLoadProgressTrackerMixin",
     "ZipFsBypassMixin",
-    "GameOptionsMixin"
+    "GameOptionsMixin",
+    "GlContextMixin"
   ],
   "injectors": {
     "defaultRequire": 1

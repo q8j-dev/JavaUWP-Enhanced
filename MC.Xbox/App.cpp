@@ -5015,6 +5015,46 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
 
     EnsureDirectoryTree(gameDir + L"\\logs");
     EnsureDirectoryTree(gameDir + L"\\crash-reports");
+
+    // Ensure options.txt has vsync disabled so Minecraft uses its own frame limiter.
+    // We force eglSwapInterval(0) always; if MC thinks vsync is on it won't limit FPS itself,
+    // causing unlimited uncapped rendering. With vsync=false and maxFps=120, MC self-limits cleanly.
+    {
+        const std::wstring optionsPath = gameDir + L"\\options.txt";
+        if (GetFileAttributesW(optionsPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            // First launch — write sensible defaults
+            const char* defaultOptions =
+                "enableVsync:false\n"
+                "maxFps:120\n"
+                "renderDistance:8\n"
+                "gamma:1.0\n";
+            FILE* of = nullptr;
+            if (_wfopen_s(&of, optionsPath.c_str(), L"w") == 0 && of) {
+                fputs(defaultOptions, of);
+                fclose(of);
+                WriteLog(L"Wrote default options.txt (vsync=false, maxFps=120)");
+            }
+        } else {
+            // options.txt exists — patch enableVsync=true to false so the swap override works
+            std::string optContents;
+            FILE* rf = nullptr;
+            if (_wfopen_s(&rf, optionsPath.c_str(), L"r") == 0 && rf) {
+                char buf[256];
+                while (fgets(buf, sizeof(buf), rf)) optContents += buf;
+                fclose(rf);
+            }
+            if (optContents.find("enableVsync:true") != std::string::npos) {
+                for (size_t pos = 0; (pos = optContents.find("enableVsync:true", pos)) != std::string::npos;)
+                    optContents.replace(pos, 16, "enableVsync:false");
+                FILE* wf = nullptr;
+                if (_wfopen_s(&wf, optionsPath.c_str(), L"w") == 0 && wf) {
+                    fputs(optContents.c_str(), wf);
+                    fclose(wf);
+                    WriteLog(L"Patched options.txt: enableVsync false");
+                }
+            }
+        }
+    }
     EnsureDirectoryTree(userModsDir);
     EnsureDirectoryTree(lwjglTmpDir);
     DeleteFileW(fabricLogPath.c_str());
@@ -5046,10 +5086,14 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     vmOptionStorage.reserve(16);
     vmOptionStorage.push_back("-Xmx4G");
     vmOptionStorage.push_back("-Xms4G");
-    vmOptionStorage.push_back("-XX:+UseZGC");            // generational ZGC is default in Java 23+
-    vmOptionStorage.push_back("-XX:SoftMaxHeapSize=3g");  // ZGC: soft GC trigger before hard limit
-    vmOptionStorage.push_back("-XX:ZUncommitDelay=30");   // ZGC: return unused memory after 30s
-    vmOptionStorage.push_back("-XX:CICompilerCount=2");   // 2 JIT threads; frees cores for chunk builders
+    // ZGC: concurrent GC with <1ms pauses. Generational is default in Java 23+.
+    vmOptionStorage.push_back("-XX:+UseZGC");
+    vmOptionStorage.push_back("-XX:SoftMaxHeapSize=3500m");   // soft GC trigger, keeps 500m headroom
+    vmOptionStorage.push_back("-XX:ZUncommitDelay=60");        // return unused pages after 60s idle
+    vmOptionStorage.push_back("-XX:+DisableExplicitGC");       // ignore System.gc() calls from mods/MC
+    vmOptionStorage.push_back("-XX:+AlwaysPreTouch");          // pre-fault heap pages at startup, no alloc latency later
+    vmOptionStorage.push_back("-XX:+PerfDisableSharedMem");    // disable JVM perf counters shared memory writes
+    vmOptionStorage.push_back("-XX:CICompilerCount=2");        // 2 JIT threads; frees cores for chunk builders
     vmOptionStorage.push_back("-XX:ReservedCodeCacheSize=512m");
     vmOptionStorage.push_back("-XX:+OptimizeStringConcat");
     vmOptionStorage.push_back("-XX:+UseCompressedOops");
@@ -5337,19 +5381,27 @@ public:
         SetCurrentDirectoryW(exeDir.c_str());
         SetEnvironmentVariableW(L"MC_RUNTIME_DIR", exeDir.c_str());
 
-        // Mesa performance: threaded GL context (moves all driver work off the render thread)
-        SetEnvironmentVariableW(L"GALLIUM_THREAD", L"1");
-        // Mesa driconf overrides via env var (Mesa reads option name directly)
-        SetEnvironmentVariableW(L"mesa_no_error", L"1");                           // skip GL error checking (lowercase)
-        SetEnvironmentVariableW(L"MESA_NO_ERROR", L"1");                           // skip GL error checking (uppercase)
-        SetEnvironmentVariableW(L"allow_draw_out_of_order", L"1");                 // reorder draws for GPU efficiency
-        SetEnvironmentVariableW(L"ALLOW_DRAW_OUT_OF_ORDER", L"1");                 // uppercase variant
-        SetEnvironmentVariableW(L"glthread_nop_check_framebuffer_status", L"1");   // no sync on glCheckFramebufferStatus
-        SetEnvironmentVariableW(L"GLTHREAD_NOP_CHECK_FRAMEBUFFER_STATUS", L"1");   // uppercase variant
-        SetEnvironmentVariableW(L"override_vram_size", L"8192");                   // report 8GB VRAM to Sodium
-        SetEnvironmentVariableW(L"OVERRIDE_VRAM_SIZE", L"8192");                   // uppercase variant
         const std::wstring graphicsRuntime = DetectGraphicsRuntimeName();
         SetEnvironmentVariableW(L"MC_GRAPHICS_RUNTIME", graphicsRuntime.c_str());
+
+        // Mesa/Gallium performance options (Series only — Xbox One uses ANGLE which ignores these)
+        if (graphicsRuntime == L"mesa") {
+            // Threaded GL context: moves all D3D12 translation off the render thread
+            SetEnvironmentVariableW(L"GALLIUM_THREAD", L"1");
+            // Mesa driconf option overrides — set both cases; Mesa format varies by build
+            SetEnvironmentVariableW(L"mesa_no_error", L"1");
+            SetEnvironmentVariableW(L"MESA_NO_ERROR", L"1");
+            SetEnvironmentVariableW(L"allow_draw_out_of_order", L"1");
+            SetEnvironmentVariableW(L"ALLOW_DRAW_OUT_OF_ORDER", L"1");
+            SetEnvironmentVariableW(L"glthread_nop_check_framebuffer_status", L"1");
+            SetEnvironmentVariableW(L"GLTHREAD_NOP_CHECK_FRAMEBUFFER_STATUS", L"1");
+            // Report 8GB VRAM so Sodium allocates full-size buffer pools
+            SetEnvironmentVariableW(L"override_vram_size", L"8192");
+            SetEnvironmentVariableW(L"OVERRIDE_VRAM_SIZE", L"8192");
+            // Increase TC ring buffer so Java can queue more work ahead of the driver thread
+            SetEnvironmentVariableW(L"tc_max_cpu_storage_size", L"524288");
+            SetEnvironmentVariableW(L"TC_MAX_CPU_STORAGE_SIZE", L"524288");
+        }
         const std::wstring mobileGluesDir = exeDir + L"\\mobileglues";
         EnsureDirectoryTree(mobileGluesDir);
         SetEnvironmentVariableW(L"MG_DIR_PATH", mobileGluesDir.c_str());

@@ -272,6 +272,7 @@ typedef EGLBoolean (WINAPI* PFN_eglMakeCurrent)(EGLDisplay, EGLSurface, EGLSurfa
 typedef EGLBoolean (WINAPI* PFN_eglSwapBuffers)(EGLDisplay, EGLSurface);
 typedef EGLBoolean (WINAPI* PFN_eglSwapInterval)(EGLDisplay, EGLint);
 typedef EGLBoolean (WINAPI* PFN_eglQuerySurface)(EGLDisplay, EGLSurface, EGLint, EGLint*);
+typedef EGLBoolean (WINAPI* PFN_eglSurfaceAttrib)(EGLDisplay, EGLSurface, EGLint, EGLint);
 typedef const char* (WINAPI* PFN_eglQueryString)(EGLDisplay, EGLint);
 typedef void* (WINAPI* PFN_eglGetProcAddress)(const char*);
 typedef EGLint (WINAPI* PFN_eglGetError)(void);
@@ -333,6 +334,7 @@ static PFN_eglMakeCurrent p_eglMakeCurrent = nullptr;
 static PFN_eglSwapBuffers p_eglSwapBuffers = nullptr;
 static PFN_eglSwapInterval p_eglSwapInterval = nullptr;
 static PFN_eglQuerySurface p_eglQuerySurface = nullptr;
+static PFN_eglSurfaceAttrib p_eglSurfaceAttrib = nullptr;
 static PFN_eglQueryString p_eglQueryString = nullptr;
 static PFN_eglGetProcAddress p_eglGetProcAddress = nullptr;
 static PFN_eglGetError p_eglGetError = nullptr;
@@ -1236,6 +1238,7 @@ static bool LoadMesaEGL() {
     p_eglSwapBuffers = (PFN_eglSwapBuffers)ResolveProc(g_libEGL, "eglSwapBuffers");
     p_eglSwapInterval = (PFN_eglSwapInterval)ResolveProc(g_libEGL, "eglSwapInterval");
     p_eglQuerySurface = (PFN_eglQuerySurface)ResolveProc(g_libEGL, "eglQuerySurface");
+    p_eglSurfaceAttrib = (PFN_eglSurfaceAttrib)ResolveProc(g_libEGL, "eglSurfaceAttrib");
     p_eglQueryString = (PFN_eglQueryString)ResolveProc(g_libEGL, "eglQueryString");
     p_eglGetProcAddress = (PFN_eglGetProcAddress)ResolveProc(g_libEGL, "eglGetProcAddress");
     p_eglGetError = (PFN_eglGetError)ResolveProc(g_libEGL, "eglGetError");
@@ -1278,13 +1281,19 @@ static bool CreateEglContext() {
     }
 
     const EGLint renderableType = g_graphicsRuntimeUsesGles ? EGL_OPENGL_ES3_BIT_KHR : EGL_OPENGL_BIT;
+#define EGL_SWAP_BEHAVIOR_PRESERVED_BIT 0x0400
+#define EGL_SWAP_BEHAVIOR               0x3093
+#define EGL_BUFFER_DESTROYED            0x3095
+
+    // Request BUFFER_DESTROYED: Mesa doesn't preserve previous frame content.
+    // MC redraws every pixel every frame, so this is safe and avoids a copy.
     const EGLint configAttrs[] = {
         EGL_RED_SIZE, 8,
         EGL_GREEN_SIZE, 8,
         EGL_BLUE_SIZE, 8,
         EGL_ALPHA_SIZE, 8,
         EGL_DEPTH_SIZE, 24,
-        EGL_STENCIL_SIZE, 8,
+        EGL_STENCIL_SIZE, 0,   // Minecraft/Sodium does not use stencil
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
         EGL_RENDERABLE_TYPE, renderableType,
         EGL_NONE
@@ -1363,6 +1372,12 @@ static bool CreateEglContext() {
 
     if (g_eglSurface == EGL_NO_SURFACE) {
         return false;
+    }
+
+    // Tell Mesa it doesn't need to preserve the previous frame's contents.
+    // MC redraws every pixel every frame. Avoids an implicit copy in the driver.
+    if (p_eglSurfaceAttrib) {
+        p_eglSurfaceAttrib(g_eglDisplay, g_eglSurface, EGL_SWAP_BEHAVIOR, EGL_BUFFER_DESTROYED);
     }
 
     if (p_eglQuerySurface) {
