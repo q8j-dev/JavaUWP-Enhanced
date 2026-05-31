@@ -1236,14 +1236,37 @@ static bool CreateEglContext() {
         return false;
     }
 
-    // The raw CoreWindow path is the stable Mesa UWP path. The PropertySet path
-    // can report success but present a black surface on Xbox.
-    g_eglSurface = p_eglCreateWindowSurface(g_eglDisplay, g_eglConfig,
-        reinterpret_cast<EGLNativeWindowType>(g_coreWindow.Get()), nullptr);
-    if (g_eglSurface != EGL_NO_SURFACE) {
-        ShimLog("eglCreateWindowSurface(CoreWindow) succeeded");
-    } else {
-        ReportEglError("eglCreateWindowSurface(CoreWindow)");
+    const bool needsScaledSurface = (g_content_scale_x > 1.0f || g_content_scale_y > 1.0f);
+
+    if (needsScaledSurface) {
+        if (BuildNativeWindowPropertySet()) {
+            g_eglSurface = p_eglCreateWindowSurface(g_eglDisplay, g_eglConfig,
+                reinterpret_cast<EGLNativeWindowType>(g_nativeWindowPropertySet.Get()), nullptr);
+            if (g_eglSurface != EGL_NO_SURFACE) {
+                ShimLog("eglCreateWindowSurface(PropertySet scaled) succeeded");
+            } else {
+                ReportEglError("eglCreateWindowSurface(PropertySet scaled)");
+            }
+            if (g_eglSurface == EGL_NO_SURFACE && p_eglCreatePlatformWindowSurface) {
+                g_eglSurface = p_eglCreatePlatformWindowSurface(g_eglDisplay, g_eglConfig,
+                    g_nativeWindowPropertySet.Get(), nullptr);
+                if (g_eglSurface != EGL_NO_SURFACE) {
+                    ShimLog("eglCreatePlatformWindowSurface(PropertySet scaled) succeeded");
+                } else {
+                    ReportEglError("eglCreatePlatformWindowSurface(PropertySet scaled)");
+                }
+            }
+        }
+    }
+
+    if (g_eglSurface == EGL_NO_SURFACE) {
+        g_eglSurface = p_eglCreateWindowSurface(g_eglDisplay, g_eglConfig,
+            reinterpret_cast<EGLNativeWindowType>(g_coreWindow.Get()), nullptr);
+        if (g_eglSurface != EGL_NO_SURFACE) {
+            ShimLog("eglCreateWindowSurface(CoreWindow) succeeded");
+        } else {
+            ReportEglError("eglCreateWindowSurface(CoreWindow)");
+        }
     }
 
     if (g_eglSurface == EGL_NO_SURFACE && p_eglCreatePlatformWindowSurface) {
