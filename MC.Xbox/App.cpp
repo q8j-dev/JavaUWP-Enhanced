@@ -5100,8 +5100,8 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     vmOptionStorage.push_back("-XX:SoftMaxHeapSize=3500m");   // soft GC trigger, keeps 500m headroom
     vmOptionStorage.push_back("-XX:ZUncommitDelay=60");        // return unused pages after 60s idle
     vmOptionStorage.push_back("-XX:+DisableExplicitGC");       // ignore System.gc() calls from mods/MC
-    vmOptionStorage.push_back("-XX:+AlwaysPreTouch");          // pre-fault heap pages at startup, no alloc latency later
-    vmOptionStorage.push_back("-XX:+PerfDisableSharedMem");    // disable JVM perf counters shared memory writes
+    // AlwaysPreTouch omitted: pre-faulting 4GB at startup kills the process in Xbox UWP sandbox
+    // PerfDisableSharedMem omitted: shared memory perf counters may not exist in UWP; flag can crash JVM init
     vmOptionStorage.push_back("-XX:CICompilerCount=2");        // 2 JIT threads; frees cores for chunk builders
     vmOptionStorage.push_back("-XX:ReservedCodeCacheSize=512m");
     vmOptionStorage.push_back("-XX:+OptimizeStringConcat");
