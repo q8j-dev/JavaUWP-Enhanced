@@ -5095,8 +5095,10 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     vmOptionStorage.reserve(16);
     vmOptionStorage.push_back("-Xmx4G");
     vmOptionStorage.push_back("-Xms4G");
-    vmOptionStorage.push_back("-XX:+UseZGC");
+    // ZGC omitted: requires VirtualAlloc2 address space reservation which Xbox UWP sandbox may deny.
+    // G1GC is the default for Java 25 and works correctly in UWP.
     vmOptionStorage.push_back("-XX:+DisableExplicitGC");
+    vmOptionStorage.push_back("-XX:MaxGCPauseMillis=20");
     vmOptionStorage.push_back("-XX:CICompilerCount=2");
     vmOptionStorage.push_back("-XX:ReservedCodeCacheSize=512m");
     vmOptionStorage.push_back("--enable-native-access=ALL-UNNAMED");
