@@ -1059,6 +1059,8 @@ struct WinHttpConnection {
     ~WinHttpConnection() { Close(); }
 };
 
+static std::wstring BuildRedirectUrl(const std::wstring& currentUrl, const std::wstring& location);
+
 static bool DownloadUrlToFileWithConn(
     WinHttpConnection& conn,
     const std::wstring& url,
@@ -1155,7 +1157,7 @@ static bool DownloadUrlToFileWithConn(
             if (locationBytes > 0 && WinHttpQueryHeaders(request, WINHTTP_QUERY_LOCATION,
                 WINHTTP_HEADER_NAME_BY_INDEX, location.data(), &locationBytes,
                 WINHTTP_NO_HEADER_INDEX)) {
-                currentUrl = BuildRedirectUrl(currentUrl, location.data());
+                currentUrl = BuildRedirectUrl(currentUrl, std::wstring(location.data()));
                 WinHttpCloseHandle(request);
                 continue;
             }
@@ -1350,7 +1352,7 @@ static bool DownloadUrlToFile(
                     location.data(),
                     &locationBytes,
                     WINHTTP_NO_HEADER_INDEX)) {
-                currentUrl = BuildRedirectUrl(currentUrl, location.data());
+                currentUrl = BuildRedirectUrl(currentUrl, std::wstring(location.data()));
                 WinHttpCloseHandle(request);
                 WinHttpCloseHandle(connect);
                 WinHttpCloseHandle(session);

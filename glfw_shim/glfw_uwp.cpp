@@ -1010,6 +1010,7 @@ static void GetDisplayScale(double& scaleX, double& scaleY) {
 static void InvalidateDisplayScale() {
     g_scale_cached = false;
     g_metrics_dirty = true;
+    g_framebuffer_from_egl = false;
 }
 
 static void RefreshWindowMetrics(bool fireCallbacks) {
@@ -1050,6 +1051,16 @@ static void RefreshWindowMetrics(bool fireCallbacks) {
     g_framebuffer_height = newFramebufferHeight;
     g_content_scale_x = newContentScaleX;
     g_content_scale_y = newContentScaleY;
+    if (!g_framebuffer_from_egl && g_eglSurface != EGL_NO_SURFACE && p_eglQuerySurface && g_eglDisplay != EGL_NO_DISPLAY) {
+        EGLint surfW = 0, surfH = 0;
+        if (p_eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_WIDTH, &surfW) &&
+            p_eglQuerySurface(g_eglDisplay, g_eglSurface, EGL_HEIGHT, &surfH) &&
+            surfW > 0 && surfH > 0) {
+            g_framebuffer_width = surfW;
+            g_framebuffer_height = surfH;
+            g_framebuffer_from_egl = true;
+        }
+    }
     g_vidmode.width = g_framebuffer_width;
     g_vidmode.height = g_framebuffer_height;
     g_fake_window.width = g_window_width;
