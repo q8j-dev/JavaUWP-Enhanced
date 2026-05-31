@@ -1383,7 +1383,16 @@ static bool CreateEglContext() {
         }
     }
 
+#define EGL_CONTEXT_OPENGL_NO_ERROR_KHR 0x31B3
+
     const EGLint desktopContextAttrs[] = {
+        EGL_CONTEXT_MAJOR_VERSION_KHR, 3,
+        EGL_CONTEXT_MINOR_VERSION_KHR, 2,
+        EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR,
+        EGL_CONTEXT_OPENGL_NO_ERROR_KHR, EGL_TRUE,
+        EGL_NONE
+    };
+    const EGLint desktopContextAttrsNoNoError[] = {
         EGL_CONTEXT_MAJOR_VERSION_KHR, 3,
         EGL_CONTEXT_MINOR_VERSION_KHR, 2,
         EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR,
@@ -1395,6 +1404,10 @@ static bool CreateEglContext() {
     };
     const EGLint* contextAttrs = g_graphicsRuntimeUsesGles ? glesContextAttrs : desktopContextAttrs;
     g_eglContext = p_eglCreateContext(g_eglDisplay, g_eglConfig, EGL_NO_CONTEXT, contextAttrs);
+    if (g_eglContext == EGL_NO_CONTEXT && !g_graphicsRuntimeUsesGles) {
+        // Retry without no-error in case the extension isn't supported
+        g_eglContext = p_eglCreateContext(g_eglDisplay, g_eglConfig, EGL_NO_CONTEXT, desktopContextAttrsNoNoError);
+    }
     if (g_eglContext == EGL_NO_CONTEXT) {
         ReportEglError(g_graphicsRuntimeUsesGles ? "eglCreateContext(GLES3)" : "eglCreateContext(3.2 core)");
         g_eglContext = p_eglCreateContext(g_eglDisplay, g_eglConfig, EGL_NO_CONTEXT, nullptr);
