@@ -2741,7 +2741,7 @@ public:
         d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0xF5F7F8), white.GetAddressOf());
         d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0xA9B0B4), muted.GetAddressOf());
         d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0x151718), panel.GetAddressOf());
-        d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0x70C486), accent.GetAddressOf());
+        d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0x79C05A), accent.GetAddressOf());
         d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0xE36A5C), danger.GetAddressOf());
         d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0x000000), black.GetAddressOf());
 
@@ -2764,16 +2764,16 @@ public:
 
         const std::wstring title = state.title.empty() ? L"Microsoft sign-in" : state.title;
         if (state.showModsPage) {
-            const float left = frame.left + 36.0f;
+            const float left = frame.left + 44.0f;
             const float tabsRight = frame.left + (frame.right - frame.left) * 0.22f;
-            const float cardsLeft = tabsRight + 34.0f;
-            const float cardsRight = frame.right - 36.0f;
-            const float top = frame.top + 34.0f;
+            const float cardsLeft = tabsRight + 40.0f;
+            const float cardsRight = frame.right - 44.0f;
+            const float top = frame.top + 40.0f;
             const float buttonH = 58.0f;
             const float buttonGap = 22.0f;
             const wchar_t* tabs[] = { L"Installed", L"Popular", L"Latest", L"Recommended" };
 
-            DrawText(L"Mods", bodyFormat_.Get(), D2D1::RectF(left, top, tabsRight, top + 42.0f), white.Get());
+            DrawText(L"Mods", bodyFormat_.Get(), D2D1::RectF(left, top, tabsRight, top + 50.0f), white.Get());
 
             for (int i = 0; i < 4; ++i) {
                 const float y = top + 76.0f + i * (buttonH + buttonGap);
@@ -2791,7 +2791,7 @@ public:
 
             if (!state.status.empty()) {
                 DrawText(state.status.c_str(), smallFormat_.Get(),
-                    D2D1::RectF(left, frame.bottom - 112.0f, tabsRight, frame.bottom - 30.0f),
+                    D2D1::RectF(left, frame.bottom - 120.0f, tabsRight, frame.bottom - 36.0f),
                     state.isError ? danger.Get() : muted.Get());
             }
 
@@ -2898,19 +2898,21 @@ public:
         }
 
         if (state.showMainMenu) {
-            const float left = frame.left + 36.0f;
+            const float left = frame.left + 44.0f;
             const float menuRight = frame.left + (frame.right - frame.left) * 0.34f;
-            const float previewLeft = menuRight + 34.0f;
-            const float previewRight = frame.right - 36.0f;
-            const float top = frame.top + 34.0f;
-            const float buttonH = 62.0f;
-            const float buttonGap = 24.0f;
+            const float previewLeft = menuRight + 40.0f;
+            const float previewRight = frame.right - 44.0f;
+            const float top = frame.top + 40.0f;
+            const float buttonH = 72.0f;
+            const float buttonGap = 20.0f;
             const wchar_t* labels[] = { L"Play", L"Mods", L"Repair downloads", L"Sign out" };
 
-            DrawText(title.c_str(), bodyFormat_.Get(), D2D1::RectF(left, top, menuRight, top + 42.0f), white.Get());
+            // Logo: "Bandit Launcher" title, larger and prominent
+            const D2D1_RECT_F logoRect = D2D1::RectF(left, top, menuRight, top + 56.0f);
+            DrawText(title.c_str(), bodyFormat_.Get(), logoRect, accent.Get());
 
             for (int i = 0; i < 4; ++i) {
-                const float y = top + 76.0f + i * (buttonH + buttonGap);
+                const float y = top + 96.0f + i * (buttonH + buttonGap);
                 const D2D1_RECT_F button = D2D1::RectF(left, y, menuRight, y + buttonH);
                 if (i == state.selectedMenuIndex) {
                     d2dContext_->FillRectangle(button, panel.Get());
@@ -2918,16 +2920,16 @@ public:
                 } else {
                     d2dContext_->DrawRectangle(button, white.Get(), 2.0f);
                 }
-                const D2D1_RECT_F textRect = D2D1::RectF(button.left + 18.0f, button.top + 12.0f, button.right - 12.0f, button.bottom - 8.0f);
+                const D2D1_RECT_F textRect = D2D1::RectF(button.left + 20.0f, button.top + 14.0f, button.right - 14.0f, button.bottom - 10.0f);
                 DrawText(labels[i], bodyFormat_.Get(), textRect, i == state.selectedMenuIndex ? accent.Get() : white.Get());
             }
 
             if (!state.status.empty()) {
-                const D2D1_RECT_F statusRect = D2D1::RectF(left, frame.bottom - 88.0f, menuRight, frame.bottom - 28.0f);
+                const D2D1_RECT_F statusRect = D2D1::RectF(left, frame.bottom - 96.0f, menuRight, frame.bottom - 32.0f);
                 DrawText(state.status.c_str(), smallFormat_.Get(), statusRect, state.isError ? danger.Get() : muted.Get());
             }
 
-            const D2D1_RECT_F preview = D2D1::RectF(previewLeft, top, previewRight, frame.bottom - 34.0f);
+            const D2D1_RECT_F preview = D2D1::RectF(previewLeft, top, previewRight, frame.bottom - 40.0f);
             d2dContext_->FillRectangle(preview, black.Get());
             d2dContext_->DrawRectangle(preview, white.Get(), 2.0f);
             const float inset = 8.0f;
@@ -2935,7 +2937,7 @@ public:
             DrawPanorama(pano, state.animation);
 
             if (!state.detail.empty()) {
-                const D2D1_RECT_F detailRect = D2D1::RectF(preview.left + 26.0f, preview.bottom - 82.0f, preview.right - 26.0f, preview.bottom - 24.0f);
+                const D2D1_RECT_F detailRect = D2D1::RectF(preview.left + 30.0f, preview.bottom - 90.0f, preview.right - 30.0f, preview.bottom - 28.0f);
                 DrawText(state.detail.c_str(), smallFormat_.Get(), detailRect, muted.Get());
             }
 
@@ -2944,23 +2946,26 @@ public:
         }
 
         if (!state.showDeviceCode) {
-            const float left = frame.left + 54.0f;
-            const float right = frame.right - 54.0f;
-            const D2D1_RECT_F titleRect = D2D1::RectF(left, frame.top + 72.0f, right, frame.top + 130.0f);
+            const float left = frame.left + 64.0f;
+            const float right = frame.right - 64.0f;
+            // Large logo at top of loading/progress screens
+            const D2D1_RECT_F logoRect = D2D1::RectF(left, frame.top + 64.0f, right, frame.top + 130.0f);
+            DrawText(L"Bandit Launcher", bodyFormat_.Get(), logoRect, accent.Get());
+            const D2D1_RECT_F titleRect = D2D1::RectF(left, frame.top + 148.0f, right, frame.top + 214.0f);
             DrawText(title.c_str(), bodyFormat_.Get(), titleRect, white.Get());
 
-            const D2D1_RECT_F statusRect = D2D1::RectF(left, frame.top + 178.0f, right, frame.top + 240.0f);
+            const D2D1_RECT_F statusRect = D2D1::RectF(left, frame.top + 224.0f, right, frame.top + 296.0f);
             DrawText(state.status.c_str(), bodyFormat_.Get(), statusRect, state.isError ? danger.Get() : white.Get());
 
             if (!state.detail.empty()) {
-                const D2D1_RECT_F detailRect = D2D1::RectF(left, frame.top + 248.0f, right, frame.top + 306.0f);
+                const D2D1_RECT_F detailRect = D2D1::RectF(left, frame.top + 304.0f, right, frame.top + 370.0f);
                 DrawText(state.detail.c_str(), smallFormat_.Get(), detailRect, muted.Get());
             }
 
             if (state.progress >= 0.0f) {
                 const float progress = (std::max)(0.0f, (std::min)(1.0f, state.progress));
-                const float barTop = frame.bottom - 130.0f;
-                const float barHeight = 18.0f;
+                const float barTop = frame.bottom - 140.0f;
+                const float barHeight = 22.0f;
                 const D2D1_RECT_F track = D2D1::RectF(left, barTop, right, barTop + barHeight);
                 const D2D1_RECT_F fill = D2D1::RectF(left, barTop, left + (right - left) * progress, barTop + barHeight);
                 d2dContext_->FillRectangle(track, panel.Get());
@@ -2968,7 +2973,7 @@ public:
 
                 wchar_t percent[32] = {};
                 swprintf_s(percent, L"%d%%", static_cast<int>(progress * 100.0f + 0.5f));
-                const D2D1_RECT_F percentRect = D2D1::RectF(left, barTop + 28.0f, left + 140.0f, barTop + 68.0f);
+                const D2D1_RECT_F percentRect = D2D1::RectF(left, barTop + 32.0f, left + 160.0f, barTop + 76.0f);
                 DrawText(percent, smallFormat_.Get(), percentRect, muted.Get());
             }
 
@@ -2978,15 +2983,19 @@ public:
 
         const float dividerX = frame.left + (frame.right - frame.left) * 0.52f;
         d2dContext_->DrawLine(
-            D2D1::Point2F(dividerX, frame.top + 32.0f),
-            D2D1::Point2F(dividerX, frame.bottom - 32.0f),
+            D2D1::Point2F(dividerX, frame.top + 36.0f),
+            D2D1::Point2F(dividerX, frame.bottom - 36.0f),
             white.Get(),
             3.0f);
 
-        const D2D1_RECT_F titleRect = D2D1::RectF(frame.left + 42.0f, frame.top + 34.0f, dividerX - 42.0f, frame.top + 86.0f);
+        // Logo above title on device code screen
+        const D2D1_RECT_F logoRect = D2D1::RectF(frame.left + 50.0f, frame.top + 36.0f, dividerX - 50.0f, frame.top + 86.0f);
+        DrawText(L"Bandit Launcher", bodyFormat_.Get(), logoRect, accent.Get());
+
+        const D2D1_RECT_F titleRect = D2D1::RectF(frame.left + 50.0f, frame.top + 96.0f, dividerX - 50.0f, frame.top + 142.0f);
         DrawText(title.c_str(), bodyFormat_.Get(), titleRect, white.Get());
 
-        const D2D1_RECT_F codeBox = D2D1::RectF(frame.left + 42.0f, frame.top + 102.0f, dividerX - 42.0f, frame.top + 190.0f);
+        const D2D1_RECT_F codeBox = D2D1::RectF(frame.left + 50.0f, frame.top + 158.0f, dividerX - 50.0f, frame.top + 252.0f);
         d2dContext_->DrawRectangle(codeBox, white.Get(), 2.0f);
         if (!state.userCode.empty()) {
             DrawText(state.userCode.c_str(), codeFormat_.Get(), codeBox, white.Get());
@@ -2994,18 +3003,18 @@ public:
 
         std::wstring instruction = L"Enter this code at";
         std::wstring url = state.verificationUri.empty() ? L"microsoft.com/link" : state.verificationUri;
-        const D2D1_RECT_F bodyRect = D2D1::RectF(frame.left + 46.0f, frame.top + 218.0f, dividerX - 48.0f, frame.top + 326.0f);
+        const D2D1_RECT_F bodyRect = D2D1::RectF(frame.left + 50.0f, frame.top + 272.0f, dividerX - 50.0f, frame.top + 390.0f);
         DrawText((instruction + L"\n" + url).c_str(), bodyFormat_.Get(), bodyRect, white.Get());
 
         std::wstring status = state.status;
         if (state.secondsRemaining > 0) {
             status += L"\nCode expires in " + std::to_wstring(state.secondsRemaining) + L" seconds";
         }
-        const D2D1_RECT_F statusRect = D2D1::RectF(frame.left + 46.0f, frame.bottom - 116.0f, dividerX - 48.0f, frame.bottom - 38.0f);
+        const D2D1_RECT_F statusRect = D2D1::RectF(frame.left + 50.0f, frame.bottom - 124.0f, dividerX - 50.0f, frame.bottom - 44.0f);
         DrawText(status.c_str(), smallFormat_.Get(), statusRect, state.isError ? danger.Get() : muted.Get());
 
         if (!state.detail.empty()) {
-            const D2D1_RECT_F detailRect = D2D1::RectF(frame.left + 46.0f, frame.bottom - 160.0f, dividerX - 48.0f, frame.bottom - 118.0f);
+            const D2D1_RECT_F detailRect = D2D1::RectF(frame.left + 50.0f, frame.bottom - 172.0f, dividerX - 50.0f, frame.bottom - 128.0f);
             DrawText(state.detail.c_str(), smallFormat_.Get(), detailRect, muted.Get());
         }
 
@@ -3161,16 +3170,16 @@ private:
 
         dwriteFactory_->CreateTextFormat(
             codeFontName, fc, DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL, 48.0f, L"en-US", codeFormat_.GetAddressOf());
+            DWRITE_FONT_STRETCH_NORMAL, 56.0f, L"en-US", codeFormat_.GetAddressOf());
         dwriteFactory_->CreateTextFormat(
             fontName, fc, DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL, 30.0f, L"en-US", bodyFormat_.GetAddressOf());
+            DWRITE_FONT_STRETCH_NORMAL, 36.0f, L"en-US", bodyFormat_.GetAddressOf());
         dwriteFactory_->CreateTextFormat(
             fontName, fc, DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL, 21.0f, L"en-US", smallFormat_.GetAddressOf());
+            DWRITE_FONT_STRETCH_NORMAL, 26.0f, L"en-US", smallFormat_.GetAddressOf());
         dwriteFactory_->CreateTextFormat(
             fontName, fc, DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL, 22.0f, L"en-US", cardTitleFormat_.GetAddressOf());
+            DWRITE_FONT_STRETCH_NORMAL, 27.0f, L"en-US", cardTitleFormat_.GetAddressOf());
 
         if (codeFormat_) {
             codeFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
