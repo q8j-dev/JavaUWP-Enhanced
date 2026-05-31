@@ -5044,8 +5044,13 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
 
     std::vector<std::string> vmOptionStorage;
     vmOptionStorage.reserve(16);
-    vmOptionStorage.push_back("-Xmx2G");
-    vmOptionStorage.push_back("-Xms2G");
+    vmOptionStorage.push_back("-Xmx4G");
+    vmOptionStorage.push_back("-Xms4G");
+    vmOptionStorage.push_back("-XX:+UseZGC");
+    vmOptionStorage.push_back("-XX:+ZGenerational");
+    vmOptionStorage.push_back("-XX:MaxGCPauseMillis=4");
+    vmOptionStorage.push_back("-XX:CICompilerCount=4");
+    vmOptionStorage.push_back("-XX:ReservedCodeCacheSize=512m");
     vmOptionStorage.push_back("--enable-native-access=ALL-UNNAMED");
     vmOptionStorage.push_back("--add-opens=jdk.zipfs/jdk.nio.zipfs=ALL-UNNAMED");
     const std::wstring localJavaSecurityPatch = exeDir + L"\\java-base-security-realpath.jar";
@@ -5329,6 +5334,14 @@ public:
         EnsureDirectoryTree(g_logDir);
         SetCurrentDirectoryW(exeDir.c_str());
         SetEnvironmentVariableW(L"MC_RUNTIME_DIR", exeDir.c_str());
+
+        // Mesa performance: threaded GL context (moves all driver work off the render thread)
+        SetEnvironmentVariableW(L"GALLIUM_THREAD", L"1");
+        // Mesa driconf overrides via env var (Mesa reads option name directly)
+        SetEnvironmentVariableW(L"mesa_no_error", L"1");                          // skip GL error checking
+        SetEnvironmentVariableW(L"allow_draw_out_of_order", L"1");                // reorder draws for GPU efficiency
+        SetEnvironmentVariableW(L"glthread_nop_check_framebuffer_status", L"1");  // no sync on glCheckFramebufferStatus
+        SetEnvironmentVariableW(L"override_vram_size", L"8192");                  // report 8GB VRAM to Sodium
         const std::wstring graphicsRuntime = DetectGraphicsRuntimeName();
         SetEnvironmentVariableW(L"MC_GRAPHICS_RUNTIME", graphicsRuntime.c_str());
         const std::wstring mobileGluesDir = exeDir + L"\\mobileglues";
