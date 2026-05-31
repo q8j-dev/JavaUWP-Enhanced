@@ -8,7 +8,8 @@
     "PathUtilBypassMixin",
     "SystemDetailsOshiBypassMixin",
     "WorldLoadProgressTrackerMixin",
-    "ZipFsBypassMixin"
+    "ZipFsBypassMixin",
+    "GameOptionsMixin"
   ],
   "injectors": {
     "defaultRequire": 1

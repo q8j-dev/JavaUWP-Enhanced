@@ -4757,8 +4757,8 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
 
     std::vector<std::string> vmOptionStorage;
     vmOptionStorage.reserve(16);
-    vmOptionStorage.push_back("-Xmx4G");
-    vmOptionStorage.push_back("-Xms512M");
+    vmOptionStorage.push_back("-Xmx2G");
+    vmOptionStorage.push_back("-Xms2G");
     vmOptionStorage.push_back("--enable-native-access=ALL-UNNAMED");
     vmOptionStorage.push_back("--add-opens=jdk.zipfs/jdk.nio.zipfs=ALL-UNNAMED");
     const std::wstring localJavaSecurityPatch = exeDir + L"\\java-base-security-realpath.jar";
@@ -4777,10 +4777,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     vmOptionStorage.push_back("-Djava.security.properties==" + w2a(fwd(jreDir + L"\\conf\\security\\xbox.properties")));
     vmOptionStorage.push_back("-Djava.security.egd=file:/dev/urandom");
     vmOptionStorage.push_back("-Dfabric.log.file=" + w2a(fwd(fabricLogPath)));
-    vmOptionStorage.push_back("-Dfabric.log.level=debug");
-    vmOptionStorage.push_back("-Dfabric.debug.throwDirectly=true");
-    vmOptionStorage.push_back("-Dmixin.debug.verbose=true");
-    vmOptionStorage.push_back("-Djava.io.tmpdir=" + w2a(fwd(jnaTmpDir)));
+                vmOptionStorage.push_back("-Djava.io.tmpdir=" + w2a(fwd(jnaTmpDir)));
     vmOptionStorage.push_back("-Djna.tmpdir=" + w2a(fwd(jnaTmpDir)));
     vmOptionStorage.push_back("-Djna.nosys=true");
     vmOptionStorage.push_back("-Djna.nounpack=true");
@@ -4788,9 +4785,7 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     vmOptionStorage.push_back("-Djna.boot.library.path=" + w2a(fwd(nativesDir)));
     vmOptionStorage.push_back("-Djava.library.path=" + w2a(fwd(lwjglNativeDir)));
     vmOptionStorage.push_back("-Dorg.lwjgl.librarypath=" + w2a(fwd(lwjglNativeDir)));
-    vmOptionStorage.push_back("-Dorg.lwjgl.util.Debug=true");
-    vmOptionStorage.push_back("-Dorg.lwjgl.util.DebugLoader=true");
-    vmOptionStorage.push_back("-Dorg.lwjgl.system.SharedLibraryExtractDirectory=" + w2a(fwd(lwjglTmpDir)));
+            vmOptionStorage.push_back("-Dorg.lwjgl.system.SharedLibraryExtractDirectory=" + w2a(fwd(lwjglTmpDir)));
     vmOptionStorage.push_back("-Dorg.lwjgl.glfw.libname=" + w2a(fwd(lwjglGlfwDll)));
     WriteLogF(L"LWJGL native directory: %s", lwjglNativeDir.c_str());
     WriteLogF(L"LWJGL GLFW library forced: %s", lwjglGlfwDll.c_str());
