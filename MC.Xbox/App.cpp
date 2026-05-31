@@ -30,6 +30,7 @@
 #include <mutex>
 #include <d2d1_1.h>
 #include <dwrite.h>
+#include <dwrite_3.h>
 #include <d3d11_1.h>
 #include <dxgi1_3.h>
 #include <wincodec.h>
@@ -2545,6 +2546,7 @@ public:
             WriteLogF(L"Auth screen WIC factory failed hr=0x%08X", hr);
         }
 
+        LoadMinecraftFont();
         CreateTextFormats();
         WriteLogF(L"Auth screen initialized %.0fx%.0f featureLevel=0x%X",
             width_, height_, static_cast<unsigned int>(level));
@@ -2569,12 +2571,9 @@ public:
         d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0x000000), black.GetAddressOf());
 
         d2dContext_->BeginDraw();
-        d2dContext_->Clear(D2D1::ColorF(0x070808));
+        DrawDirtBackground();
 
-        const float marginX = width_ * 0.075f;
-        const float marginY = height_ * 0.11f;
-        const D2D1_RECT_F frame = D2D1::RectF(marginX, marginY, width_ - marginX, height_ - marginY);
-        d2dContext_->DrawRectangle(frame, white.Get(), 3.0f);
+        const D2D1_RECT_F frame = D2D1::RectF(0.0f, 0.0f, width_, height_);
 
         auto finishDraw = [&]() {
             HRESULT hr = d2dContext_->EndDraw();
@@ -2864,25 +2863,138 @@ private:
     ComPtr<IDWriteTextFormat> cardTitleFormat_;
     ComPtr<ID2D1Bitmap1> panoramaFaces_[4];
     ComPtr<ID2D1Bitmap1> panoramaOverlay_;
+    ComPtr<ID2D1Bitmap1> dirtBackground_;
+    bool dirtBackgroundLoadAttempted_ = false;
+    ComPtr<IDWriteFontCollection> mcFontCollection_;
     std::map<std::wstring, ComPtr<ID2D1Bitmap1>> bitmapCache_;
     bool panoramaLoadAttempted_ = false;
     bool panoramaLoaded_ = false;
     float width_ = 1280.0f;
     float height_ = 720.0f;
 
-    void CreateTextFormats() {
+    void LoadMinecraftFont() {
+        if (mcFontCollection_) return;
         if (!dwriteFactory_) return;
+
+        const std::wstring fontPath = GetExecutableDir() + L"\\Assets\\MinecraftSeven.ttf";
+        if (GetFileAttributesW(fontPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            WriteLogF(L"MinecraftSeven.ttf not found at %s", fontPath.c_str());
+            return;
+        }
+
+        ComPtr<IDWriteFactory3> factory3;
+        if (FAILED(dwriteFactory_.As(&factory3))) {
+            WriteLog(L"DWrite Factory3 not available; falling back to system font");
+            return;
+        }
+
+        ComPtr<IDWriteFontSetBuilder> builder;
+        if (FAILED(factory3->CreateFontSetBuilder(builder.GetAddressOf()))) {
+            WriteLog(L"CreateFontSetBuilder failed");
+            return;
+        }
+
+        ComPtr<IDWriteFontFile> fontFile;
+        HRESULT hr = factory3->CreateFontFileReference(fontPath.c_str(), nullptr, fontFile.GetAddressOf());
+        if (FAILED(hr)) {
+            WriteLogF(L"CreateFontFileReference failed hr=0x%08X", hr);
+            return;
+        }
+
+        BOOL isSupported = FALSE;
+        DWRITE_FONT_FILE_TYPE fileType = DWRITE_FONT_FILE_TYPE_UNKNOWN;
+        UINT32 faceCount = 0;
+        hr = fontFile->Analyze(&isSupported, &fileType, nullptr, &faceCount);
+        if (FAILED(hr) || !isSupported || faceCount == 0) {
+            WriteLog(L"Font file analysis failed or unsupported");
+            return;
+        }
+
+        for (UINT32 i = 0; i < faceCount; ++i) {
+            DWRITE_FONT_SIMULATIONS sims = DWRITE_FONT_SIMULATIONS_NONE;
+            ComPtr<IDWriteFontFaceReference> faceRef;
+            hr = factory3->CreateFontFaceReference(fontPath.c_str(), nullptr, i, sims, faceRef.GetAddressOf());
+            if (SUCCEEDED(hr) && faceRef) {
+                builder->AddFontFaceReference(faceRef.Get());
+            }
+        }
+
+        ComPtr<IDWriteFontSet> fontSet;
+        hr = builder->CreateFontSet(fontSet.GetAddressOf());
+        if (FAILED(hr) || !fontSet) {
+            WriteLog(L"CreateFontSet failed");
+            return;
+        }
+
+        ComPtr<IDWriteFontCollection1> collection1;
+        hr = factory3->CreateFontCollectionFromFontSet(fontSet.Get(), collection1.GetAddressOf());
+        if (FAILED(hr) || !collection1) {
+            WriteLog(L"CreateFontCollectionFromFontSet failed");
+            return;
+        }
+
+        collection1.As(&mcFontCollection_);
+        WriteLog(L"MinecraftSeven font loaded");
+    }
+
+    void EnsureDirtBackground() {
+        if (dirtBackgroundLoadAttempted_) return;
+        dirtBackgroundLoadAttempted_ = true;
+        const std::wstring path = GetExecutableDir() + L"\\Assets\\dirt_background.png";
+        if (!LoadBitmapFromFile(path, dirtBackground_)) {
+            WriteLogF(L"Failed to load dirt background from %s", path.c_str());
+        } else {
+            WriteLog(L"Dirt background loaded");
+        }
+    }
+
+    void DrawDirtBackground() {
+        EnsureDirtBackground();
+        const D2D1_RECT_F full = D2D1::RectF(0.0f, 0.0f, width_, height_);
+        if (!dirtBackground_) {
+            ComPtr<ID2D1SolidColorBrush> bg;
+            d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0x070808), bg.GetAddressOf());
+            if (bg) d2dContext_->FillRectangle(full, bg.Get());
+            return;
+        }
+
+        const D2D1_SIZE_F srcSize = dirtBackground_->GetSize();
+        if (srcSize.width <= 0.0f || srcSize.height <= 0.0f) return;
+
+        const float tileW = srcSize.width;
+        const float tileH = srcSize.height;
+        for (float y = 0.0f; y < height_; y += tileH) {
+            for (float x = 0.0f; x < width_; x += tileW) {
+                const float drawW = (std::min)(tileW, width_ - x);
+                const float drawH = (std::min)(tileH, height_ - y);
+                const D2D1_RECT_F dest = D2D1::RectF(x, y, x + drawW, y + drawH);
+                const D2D1_RECT_F src = D2D1::RectF(0.0f, 0.0f, drawW, drawH);
+                d2dContext_->DrawBitmap(dirtBackground_.Get(), dest, 1.0f,
+                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, src);
+            }
+        }
+    }
+
+        void CreateTextFormats() {
+        if (!dwriteFactory_) return;
+        IDWriteFontCollection* fc = mcFontCollection_.Get();
+        const wchar_t* mcFont = L"Minecraft Seven";
+        const wchar_t* fallbackCode = L"Consolas";
+        const wchar_t* fallbackBody = L"Segoe UI";
+        const wchar_t* fontName = fc ? mcFont : fallbackBody;
+        const wchar_t* codeFontName = fc ? mcFont : fallbackCode;
+
         dwriteFactory_->CreateTextFormat(
-            L"Consolas", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+            codeFontName, fc, DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL, 48.0f, L"en-US", codeFormat_.GetAddressOf());
         dwriteFactory_->CreateTextFormat(
-            L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
+            fontName, fc, DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL, 30.0f, L"en-US", bodyFormat_.GetAddressOf());
         dwriteFactory_->CreateTextFormat(
-            L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
+            fontName, fc, DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL, 21.0f, L"en-US", smallFormat_.GetAddressOf());
         dwriteFactory_->CreateTextFormat(
-            L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+            fontName, fc, DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL, 22.0f, L"en-US", cardTitleFormat_.GetAddressOf());
 
         if (codeFormat_) {

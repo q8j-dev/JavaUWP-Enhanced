@@ -299,16 +299,20 @@ static int g_framebuffer_width = 0;
 static int g_framebuffer_height = 0;
 static float g_content_scale_x = 1.0f;
 static float g_content_scale_y = 1.0f;
-static int g_swap_log_count = 0;
-static int g_poll_log_count = 0;
-static int g_proc_log_count = 0;
-static int g_wait_log_count = 0;
-static int g_key_log_count = 0;
-static int g_controller_log_count = 0;
-static int g_gamepad_query_log_count = 0;
-static int g_current_context_log_count = 0;
-static int g_window_attrib_log_count = 0;
-static int g_extension_log_count = 0;
+static double g_cached_scale_x = 1.0;
+static double g_cached_scale_y = 1.0;
+static bool g_scale_cached = false;
+static bool g_metrics_dirty = true;
+static volatile LONG g_swap_log_count = 0;
+static volatile LONG g_poll_log_count = 0;
+static volatile LONG g_proc_log_count = 0;
+static volatile LONG g_wait_log_count = 0;
+static volatile LONG g_key_log_count = 0;
+static volatile LONG g_controller_log_count = 0;
+static volatile LONG g_gamepad_query_log_count = 0;
+static volatile LONG g_current_context_log_count = 0;
+static volatile LONG g_window_attrib_log_count = 0;
+static volatile LONG g_extension_log_count = 0;
 
 static PFN_eglGetDisplay p_eglGetDisplay = nullptr;
 static PFN_eglGetPlatformDisplay p_eglGetPlatformDisplay = nullptr;
@@ -362,6 +366,7 @@ static bool g_keyboardHooksInstalled = false;
 static bool g_gameInputCreateTried = false;
 static bool g_gamepad_present = false;
 static bool g_haveGameInputGamepadState = false;
+static bool g_gamepad_snapshot_valid = false;
 static unsigned char g_key_state[512] = {};
 static GameInputGamepadState g_lastGameInputGamepadState = {};
 static GLFWgamepadstate g_gamepad_state = {};
@@ -668,7 +673,7 @@ static void DispatchKeyEvent(VirtualKey virtualKey, const CorePhysicalKeyStatus&
     UpdateKeyState(glfwKey, glfwAction);
     const int mods = CurrentGlfwMods();
     if (g_key_log_count < 24) {
-        ++g_key_log_count;
+        InterlockedIncrement(&g_key_log_count);
         ShimLog("Key event vk=%d glfw=%d action=%d scancode=%u mods=0x%X repeat=%u",
             (int)virtualKey, glfwKey, glfwAction, status.ScanCode, mods, status.RepeatCount);
     }
@@ -745,7 +750,8 @@ static void ConvertGameInputGamepadState(const GameInputGamepadState& state) {
     memcpy(g_joystick_buttons, g_gamepad_state.buttons, sizeof(g_joystick_buttons));
 }
 
-static bool PollGameInputGamepad(bool fireCallbacks) {
+static bool PollGameInputGamepad(bool fireCallbacks, bool snapshotOnly = false) {
+    if (snapshotOnly && g_gamepad_snapshot_valid) return g_gamepad_present;
     if (!EnsureGameInput()) return false;
 
     ComPtr<IGameInputReading> reading;
@@ -766,13 +772,14 @@ static bool PollGameInputGamepad(bool fireCallbacks) {
             g_joystick_cb(GLFW_JOYSTICK_1, GLFW_DISCONNECTED);
         }
         if (g_controller_log_count < 6) {
-            ++g_controller_log_count;
+            InterlockedIncrement(&g_controller_log_count);
             ShimLog("GameInput gamepad unavailable hr=0x%08X", hr);
         }
         return false;
     }
 
     ConvertGameInputGamepadState(state);
+    g_gamepad_snapshot_valid = true;
 
     if (!g_haveGameInputGamepadState) {
         g_haveGameInputGamepadState = true;
@@ -790,7 +797,7 @@ static bool PollGameInputGamepad(bool fireCallbacks) {
          state.leftThumbstickY != g_lastGameInputGamepadState.leftThumbstickY ||
          state.rightThumbstickX != g_lastGameInputGamepadState.rightThumbstickX ||
          state.rightThumbstickY != g_lastGameInputGamepadState.rightThumbstickY)) {
-        ++g_controller_log_count;
+        InterlockedIncrement(&g_controller_log_count);
         ShimLog("GameInput gamepad state buttons=0x%X lt=%.2f rt=%.2f lx=%.2f ly=%.2f rx=%.2f ry=%.2f",
             (unsigned)state.buttons, state.leftTrigger, state.rightTrigger,
             state.leftThumbstickX, state.leftThumbstickY,
@@ -917,6 +924,16 @@ static bool AcquireCoreWindow() {
 
     g_coreWindow->get_Dispatcher(g_dispatcher.GetAddressOf());
     InstallKeyboardHooks();
+
+    using SizeChangedHandler = ABI::Windows::Foundation::__FITypedEventHandler_2_Windows__CUI__CCore__CCoreWindow_Windows__CUI__CCore__CWindowSizeChangedEventArgs_t;
+    auto sizeChangedCb = Callback<SizeChangedHandler>(
+        [](ICoreWindow*, IWindowSizeChangedEventArgs*) -> HRESULT {
+            InvalidateDisplayScale();
+            return S_OK;
+        });
+    EventRegistrationToken sizeToken = {};
+    g_coreWindow->add_SizeChanged(sizeChangedCb.Get(), &sizeToken);
+
     return true;
 }
 
@@ -927,7 +944,7 @@ static int ScaleDimensionToPixels(FLOAT value, double scale, int fallback) {
     return scaled > 0.0 ? (int)(scaled + 0.5) : fallback;
 }
 
-static void GetDisplayScale(double& scaleX, double& scaleY) {
+static void QueryDisplayScaleFromSystem(double& scaleX, double& scaleY) {
     scaleX = 1.0;
     scaleY = 1.0;
 
@@ -974,8 +991,24 @@ static void GetDisplayScale(double& scaleX, double& scaleY) {
     }
 }
 
+static void GetDisplayScale(double& scaleX, double& scaleY) {
+    if (!g_scale_cached) {
+        QueryDisplayScaleFromSystem(g_cached_scale_x, g_cached_scale_y);
+        g_scale_cached = true;
+    }
+    scaleX = g_cached_scale_x;
+    scaleY = g_cached_scale_y;
+}
+
+static void InvalidateDisplayScale() {
+    g_scale_cached = false;
+    g_metrics_dirty = true;
+}
+
 static void RefreshWindowMetrics(bool fireCallbacks) {
     if (!AcquireCoreWindow()) return;
+
+    if (!g_metrics_dirty && !fireCallbacks) return;
 
     Rect bounds = {};
     if (FAILED(g_coreWindow->get_Bounds(&bounds))) return;
@@ -1010,6 +1043,7 @@ static void RefreshWindowMetrics(bool fireCallbacks) {
     g_vidmode.height = g_framebuffer_height;
     g_fake_window.width = g_window_width;
     g_fake_window.height = g_window_height;
+    g_metrics_dirty = false;
     ShimLog("Window size %dx%d, framebuffer %dx%d, scale %.3fx%.3f",
         g_window_width, g_window_height,
         g_framebuffer_width, g_framebuffer_height,
@@ -1455,11 +1489,11 @@ extern "C" __declspec(dllexport) void glfwSetWindowTitle(GLFWwindow*, const char
 extern "C" __declspec(dllexport) void glfwSetWindowIcon(GLFWwindow*, int, const GLFWimage*) {}
 extern "C" __declspec(dllexport) void glfwGetWindowPos(GLFWwindow*, int*x, int*y) { if(x)*x=0; if(y)*y=0; }
 extern "C" __declspec(dllexport) void glfwSetWindowPos(GLFWwindow*, int, int) {}
-extern "C" __declspec(dllexport) void glfwGetWindowSize(GLFWwindow*, int*w, int*h) { RefreshWindowMetrics(false); if(w)*w=g_window_width; if(h)*h=g_window_height; }
+extern "C" __declspec(dllexport) void glfwGetWindowSize(GLFWwindow*, int*w, int*h) { if(w)*w=g_window_width; if(h)*h=g_window_height; }
 extern "C" __declspec(dllexport) void glfwSetWindowSizeLimits(GLFWwindow*, int, int, int, int) {}
 extern "C" __declspec(dllexport) void glfwSetWindowAspectRatio(GLFWwindow*, int, int) {}
 extern "C" __declspec(dllexport) void glfwSetWindowSize(GLFWwindow*, int, int) {}
-extern "C" __declspec(dllexport) void glfwGetFramebufferSize(GLFWwindow*, int*w, int*h) { RefreshWindowMetrics(false); if(w)*w=g_framebuffer_width; if(h)*h=g_framebuffer_height; }
+extern "C" __declspec(dllexport) void glfwGetFramebufferSize(GLFWwindow*, int*w, int*h) { if(w)*w=g_framebuffer_width; if(h)*h=g_framebuffer_height; }
 extern "C" __declspec(dllexport) void glfwGetWindowFrameSize(GLFWwindow*, int*l, int*t, int*r, int*b) {
     if(l)*l=0; if(t)*t=0; if(r)*r=0; if(b)*b=0;
 }
@@ -1482,7 +1516,7 @@ extern "C" __declspec(dllexport) GLFWmonitor* glfwGetWindowMonitor(GLFWwindow*) 
 extern "C" __declspec(dllexport) void glfwSetWindowMonitor(GLFWwindow*, GLFWmonitor*, int, int, int, int, int) {}
 extern "C" __declspec(dllexport) int glfwGetWindowAttrib(GLFWwindow*, int a) {
     if (g_window_attrib_log_count < 32) {
-        ++g_window_attrib_log_count;
+        InterlockedIncrement(&g_window_attrib_log_count);
         ShimLog("glfwGetWindowAttrib #%d attr=0x%08X", g_window_attrib_log_count, a);
     }
     switch (a) {
@@ -1582,32 +1616,28 @@ extern "C" __declspec(dllexport) GLFWdropfun glfwSetDropCallback(GLFWwindow*, GL
 
 extern "C" __declspec(dllexport) void glfwPollEvents(void) {
     if (g_poll_log_count < 8) {
-        ++g_poll_log_count;
+        InterlockedIncrement(&g_poll_log_count);
         ShimLog("glfwPollEvents #%d", g_poll_log_count);
     }
     if (g_dispatcher) {
         g_dispatcher->ProcessEvents(CoreProcessEventsOption_ProcessAllIfPresent);
     }
+    g_gamepad_snapshot_valid = false;
     PollGameInputGamepad(true);
     RefreshWindowMetrics(true);
 }
 extern "C" __declspec(dllexport) void glfwWaitEvents(void) {
     if (g_wait_log_count < 8) {
-        ++g_wait_log_count;
+        InterlockedIncrement(&g_wait_log_count);
         ShimLog("glfwWaitEvents #%d", g_wait_log_count);
     }
-    // UWP does not expose GLFW's native wait semantics cleanly here.
-    // Blocking on the dispatcher can stall Minecraft on a black screen,
-    // so emulate a brief wait and then poll.
-    Sleep(1);
     glfwPollEvents();
 }
 extern "C" __declspec(dllexport) void glfwWaitEventsTimeout(double) {
     if (g_wait_log_count < 8) {
-        ++g_wait_log_count;
+        InterlockedIncrement(&g_wait_log_count);
         ShimLog("glfwWaitEventsTimeout #%d", g_wait_log_count);
     }
-    Sleep(1);
     glfwPollEvents();
 }
 extern "C" __declspec(dllexport) void glfwPostEmptyEvent(void) {}
@@ -1684,7 +1714,7 @@ extern "C" __declspec(dllexport) GLFWwindow* glfwGetCurrentContext(void) {
     const DWORD tid = GetCurrentThreadId();
     GLFWwindow* current = (g_eglContext != EGL_NO_CONTEXT && g_eglContextThreadId == tid) ? (GLFWwindow*)&g_fake_window : NULL;
     if (g_current_context_log_count < 16) {
-        ++g_current_context_log_count;
+        InterlockedIncrement(&g_current_context_log_count);
         ShimLog("glfwGetCurrentContext #%d tid=%lu boundTid=%lu => %p",
             g_current_context_log_count, tid, g_eglContextThreadId, (void*)current);
     }
@@ -1692,7 +1722,7 @@ extern "C" __declspec(dllexport) GLFWwindow* glfwGetCurrentContext(void) {
 }
 extern "C" __declspec(dllexport) void glfwSwapBuffers(GLFWwindow*) {
     if (g_swap_log_count < 12) {
-        ++g_swap_log_count;
+        InterlockedIncrement(&g_swap_log_count);
         ShimLog("glfwSwapBuffers #%d", g_swap_log_count);
     }
     if (!p_eglSwapBuffers || g_eglDisplay == EGL_NO_DISPLAY || g_eglSurface == EGL_NO_SURFACE) return;
@@ -1707,7 +1737,7 @@ extern "C" __declspec(dllexport) void glfwSwapInterval(int i) {
 }
 extern "C" __declspec(dllexport) int glfwExtensionSupported(const char* name) {
     if (g_extension_log_count < 32) {
-        ++g_extension_log_count;
+        InterlockedIncrement(&g_extension_log_count);
         ShimLog("glfwExtensionSupported #%d %s => false",
             g_extension_log_count, name ? name : "(null)");
     }
@@ -1722,7 +1752,7 @@ extern "C" __declspec(dllexport) void* glfwGetProcAddress(const char* name) {
     if (!p && g_libGLESv2) p = (void*)GetProcAddress(g_libGLESv2, name);
     if (!p && g_libEGL) p = (void*)GetProcAddress(g_libEGL, name);
     if (g_proc_log_count < 200) {
-        ++g_proc_log_count;
+        InterlockedIncrement(&g_proc_log_count);
         ShimLog("glfwGetProcAddress #%d %s => %p", g_proc_log_count, name ? name : "(null)", p);
     }
     return p;
@@ -1760,17 +1790,17 @@ static bool IsSupportedJoystick(int jid) {
 
 static void LogGamepadQuery(const char* api, int jid, bool result) {
     if (g_gamepad_query_log_count >= 32) return;
-    ++g_gamepad_query_log_count;
+    InterlockedIncrement(&g_gamepad_query_log_count);
     ShimLog("%s jid=%d -> %d", api, jid, result ? 1 : 0);
 }
 
 extern "C" __declspec(dllexport) int glfwJoystickPresent(int jid) {
-    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false);
+    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false, true);
     LogGamepadQuery("glfwJoystickPresent", jid, result);
     return result ? GLFW_TRUE : GLFW_FALSE;
 }
 extern "C" __declspec(dllexport) const float* glfwGetJoystickAxes(int jid, int*c) {
-    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false);
+    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false, true);
     LogGamepadQuery("glfwGetJoystickAxes", jid, result);
     if (!result) {
         if(c)*c=0;
@@ -1780,7 +1810,7 @@ extern "C" __declspec(dllexport) const float* glfwGetJoystickAxes(int jid, int*c
     return g_joystick_axes;
 }
 extern "C" __declspec(dllexport) const unsigned char* glfwGetJoystickButtons(int jid, int*c) {
-    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false);
+    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false, true);
     LogGamepadQuery("glfwGetJoystickButtons", jid, result);
     if (!result) {
         if(c)*c=0;
@@ -1791,12 +1821,12 @@ extern "C" __declspec(dllexport) const unsigned char* glfwGetJoystickButtons(int
 }
 extern "C" __declspec(dllexport) const unsigned char* glfwGetJoystickHats(int, int*c) { if(c)*c=0; return NULL; }
 extern "C" __declspec(dllexport) const char* glfwGetJoystickName(int jid) {
-    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false);
+    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false, true);
     LogGamepadQuery("glfwGetJoystickName", jid, result);
     return result ? "Xbox Controller" : NULL;
 }
 extern "C" __declspec(dllexport) const char* glfwGetJoystickGUID(int jid) {
-    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false);
+    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false, true);
     LogGamepadQuery("glfwGetJoystickGUID", jid, result);
     return result ? "030000005e0400008e02000000000000" : NULL;
 }
@@ -1807,7 +1837,7 @@ extern "C" __declspec(dllexport) void* glfwGetJoystickUserPointer(int jid) {
     return jid == GLFW_JOYSTICK_1 ? g_joystick_user_pointer : NULL;
 }
 extern "C" __declspec(dllexport) int   glfwJoystickIsGamepad(int jid) {
-    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false);
+    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false, true);
     LogGamepadQuery("glfwJoystickIsGamepad", jid, result);
     return result ? GLFW_TRUE : GLFW_FALSE;
 }
@@ -1815,7 +1845,7 @@ extern "C" __declspec(dllexport) GLFWjoystickfun glfwSetJoystickCallback(GLFWjoy
     GLFWjoystickfun p = g_joystick_cb;
     g_joystick_cb = cb;
     if (g_gamepad_query_log_count < 32) {
-        ++g_gamepad_query_log_count;
+        InterlockedIncrement(&g_gamepad_query_log_count);
         ShimLog("glfwSetJoystickCallback cb=%p", cb);
     }
     if (cb) {
@@ -1825,12 +1855,12 @@ extern "C" __declspec(dllexport) GLFWjoystickfun glfwSetJoystickCallback(GLFWjoy
 }
 extern "C" __declspec(dllexport) int  glfwUpdateGamepadMappings(const char*) { return GLFW_TRUE; }
 extern "C" __declspec(dllexport) const char* glfwGetGamepadName(int jid) {
-    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false);
+    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false, true);
     LogGamepadQuery("glfwGetGamepadName", jid, result);
     return result ? "Xbox Controller" : NULL;
 }
 extern "C" __declspec(dllexport) int  glfwGetGamepadState(int jid, GLFWgamepadstate* state) {
-    const bool result = state && IsSupportedJoystick(jid) && PollGameInputGamepad(false);
+    const bool result = state && IsSupportedJoystick(jid) && PollGameInputGamepad(false, true);
     LogGamepadQuery("glfwGetGamepadState", jid, result);
     if (!result) {
         return GLFW_FALSE;

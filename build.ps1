@@ -397,6 +397,18 @@ if (Test-Path $panoramaSource) {
     Write-Host "Copied menu panorama assets from $panoramaSource"
 }
 
+$dirtBg = Join-Path $root "MC.Xbox\Assets\dirt_background.png"
+if (Test-Path $dirtBg) {
+    Copy-Item -Force $dirtBg (Join-Path $pkg "Assets\dirt_background.png")
+    Write-Host "Copied dirt background"
+}
+
+$mcFont = Join-Path $root "MC.Xbox\Assets\MinecraftSeven.ttf"
+if (Test-Path $mcFont) {
+    Copy-Item -Force $mcFont (Join-Path $pkg "Assets\MinecraftSeven.ttf")
+    Write-Host "Copied MinecraftSeven font"
+}
+
 Write-Host "Copying JRE..."
 Write-Host "JRE source: $jreSrc"
 Copy-Item -Recurse $jreSrc (Join-Path $pkg "jre")
