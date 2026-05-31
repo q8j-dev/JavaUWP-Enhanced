@@ -5340,10 +5340,14 @@ public:
         // Mesa performance: threaded GL context (moves all driver work off the render thread)
         SetEnvironmentVariableW(L"GALLIUM_THREAD", L"1");
         // Mesa driconf overrides via env var (Mesa reads option name directly)
-        SetEnvironmentVariableW(L"mesa_no_error", L"1");                          // skip GL error checking
-        SetEnvironmentVariableW(L"allow_draw_out_of_order", L"1");                // reorder draws for GPU efficiency
-        SetEnvironmentVariableW(L"glthread_nop_check_framebuffer_status", L"1");  // no sync on glCheckFramebufferStatus
-        SetEnvironmentVariableW(L"override_vram_size", L"8192");                  // report 8GB VRAM to Sodium
+        SetEnvironmentVariableW(L"mesa_no_error", L"1");                           // skip GL error checking (lowercase)
+        SetEnvironmentVariableW(L"MESA_NO_ERROR", L"1");                           // skip GL error checking (uppercase)
+        SetEnvironmentVariableW(L"allow_draw_out_of_order", L"1");                 // reorder draws for GPU efficiency
+        SetEnvironmentVariableW(L"ALLOW_DRAW_OUT_OF_ORDER", L"1");                 // uppercase variant
+        SetEnvironmentVariableW(L"glthread_nop_check_framebuffer_status", L"1");   // no sync on glCheckFramebufferStatus
+        SetEnvironmentVariableW(L"GLTHREAD_NOP_CHECK_FRAMEBUFFER_STATUS", L"1");   // uppercase variant
+        SetEnvironmentVariableW(L"override_vram_size", L"8192");                   // report 8GB VRAM to Sodium
+        SetEnvironmentVariableW(L"OVERRIDE_VRAM_SIZE", L"8192");                   // uppercase variant
         const std::wstring graphicsRuntime = DetectGraphicsRuntimeName();
         SetEnvironmentVariableW(L"MC_GRAPHICS_RUNTIME", graphicsRuntime.c_str());
         const std::wstring mobileGluesDir = exeDir + L"\\mobileglues";
