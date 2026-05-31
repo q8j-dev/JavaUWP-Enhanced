@@ -874,6 +874,8 @@ static bool InstallKeyboardHooks() {
 // ---------------------------------------------------------------------------
 // CoreWindow access
 // ---------------------------------------------------------------------------
+static void InvalidateDisplayScale();
+
 static bool AcquireCoreWindow() {
     if (g_coreWindow) return true;
 
