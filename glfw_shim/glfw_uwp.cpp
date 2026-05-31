@@ -1789,8 +1789,24 @@ extern "C" __declspec(dllexport) void glfwSwapBuffers(GLFWwindow*) {
     }
 }
 extern "C" __declspec(dllexport) void glfwSwapInterval(int i) {
+    // Force swap interval to 0 regardless of what Minecraft requests.
+    //
+    // With GALLIUM_THREAD=1, the Mesa driver thread handles eglSwapBuffers.
+    // With interval=1 (vsync), the driver thread blocks up to 16ms waiting
+    // for VBlank. During that stall, the TC ring buffer fills and the Java
+    // render thread stalls on the next GL call. Net result: FPS is capped
+    // at the display refresh rate AND GALLIUM_THREAD provides no FPS benefit.
+    //
+    // With interval=0, the driver thread's Present returns immediately.
+    // The TC ring buffer drains at GPU speed. Java renders at full speed.
+    // Minecraft's built-in frame limiter (maxFps in options.txt) handles
+    // pacing without vsync overhead. Set maxFps=60 or maxFps=120 in
+    // Minecraft options for smooth, tear-free output on matching displays.
+    //
+    // This is the core performance unlock on this platform.
+    (void)i;
     if (p_eglSwapInterval && g_eglDisplay != EGL_NO_DISPLAY) {
-        p_eglSwapInterval(g_eglDisplay, i);
+        p_eglSwapInterval(g_eglDisplay, 0);
     }
 }
 extern "C" __declspec(dllexport) int glfwExtensionSupported(const char* name) {
