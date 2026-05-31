@@ -106,6 +106,8 @@ jobs:
           $notes = @"
           Automated nightly build from $shortSha.
 
+          Nightly releases are highly experimental builds for testing current development work. They are not full game releases, and support is not provided for nightly builds.
+
           Commit: $env:GITHUB_SHA
           Workflow run: $runUrl
           "@
