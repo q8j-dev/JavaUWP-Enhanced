@@ -5046,11 +5046,13 @@ static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
     vmOptionStorage.reserve(16);
     vmOptionStorage.push_back("-Xmx4G");
     vmOptionStorage.push_back("-Xms4G");
-    vmOptionStorage.push_back("-XX:+UseZGC");
-    vmOptionStorage.push_back("-XX:+ZGenerational");
-    vmOptionStorage.push_back("-XX:MaxGCPauseMillis=4");
-    vmOptionStorage.push_back("-XX:CICompilerCount=4");
+    vmOptionStorage.push_back("-XX:+UseZGC");            // generational ZGC is default in Java 23+
+    vmOptionStorage.push_back("-XX:SoftMaxHeapSize=3g");  // ZGC: soft GC trigger before hard limit
+    vmOptionStorage.push_back("-XX:ZUncommitDelay=30");   // ZGC: return unused memory after 30s
+    vmOptionStorage.push_back("-XX:CICompilerCount=2");   // 2 JIT threads; frees cores for chunk builders
     vmOptionStorage.push_back("-XX:ReservedCodeCacheSize=512m");
+    vmOptionStorage.push_back("-XX:+OptimizeStringConcat");
+    vmOptionStorage.push_back("-XX:+UseCompressedOops");
     vmOptionStorage.push_back("--enable-native-access=ALL-UNNAMED");
     vmOptionStorage.push_back("--add-opens=jdk.zipfs/jdk.nio.zipfs=ALL-UNNAMED");
     const std::wstring localJavaSecurityPatch = exeDir + L"\\java-base-security-realpath.jar";

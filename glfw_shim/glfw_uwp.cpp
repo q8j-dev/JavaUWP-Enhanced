@@ -1016,7 +1016,9 @@ static void InvalidateDisplayScale() {
 static void RefreshWindowMetrics(bool fireCallbacks) {
     if (!AcquireCoreWindow()) return;
 
-    if (!g_metrics_dirty && !fireCallbacks) return;
+    // Fast path: nothing changed. Skip the COM call entirely.
+    // Do NOT re-fire callbacks with unchanged values (GLFW spec: callbacks fire on change only).
+    if (!g_metrics_dirty) return;
 
     Rect bounds = {};
     if (FAILED(g_coreWindow->get_Bounds(&bounds))) return;
@@ -1042,6 +1044,7 @@ static void RefreshWindowMetrics(bool fireCallbacks) {
         newFramebufferHeight == g_framebuffer_height &&
         newContentScaleX == g_content_scale_x &&
         newContentScaleY == g_content_scale_y) {
+        g_metrics_dirty = false;
         return;
     }
 
