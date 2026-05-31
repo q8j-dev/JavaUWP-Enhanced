@@ -381,7 +381,7 @@ struct FakeWindow {
     void* user_pointer;
 };
 static FakeWindow g_fake_window;
-static GLFWvidmode g_vidmode = {0,0,8,8,8,60}; // width/height filled in by RefreshWindowMetrics
+static GLFWvidmode g_vidmode = {0,0,8,8,8,60};
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -1335,8 +1335,6 @@ extern "C" __declspec(dllexport) int glfwInit(void) {
     ShimLog("glfwInit");
     if (g_initialised) return GLFW_TRUE;
     if (!AcquireCoreWindow()) return GLFW_FALSE;
-    // Reset to zero so RefreshWindowMetrics always applies the real CoreWindow
-    // bounds on first call, even if they happen to match the 1920x1080 defaults.
     g_window_width = 0;
     g_window_height = 0;
     g_framebuffer_width = 0;
@@ -1406,13 +1404,9 @@ extern "C" __declspec(dllexport) void glfwWindowHintString(int,const char*) {}
 
 extern "C" __declspec(dllexport)
 GLFWwindow* glfwCreateWindow(int w, int h, const char* title, GLFWmonitor*, GLFWwindow*) {
-    ShimLog("glfwCreateWindow requested %dx%d '%s' (ignored; using CoreWindow bounds)", w, h, title ? title : "");
+    ShimLog("glfwCreateWindow %dx%d '%s'", w, h, title ? title : "");
     if (!g_initialised && !glfwInit()) return NULL;
 
-    // Always derive the actual window size from CoreWindow bounds.
-    // Minecraft passes a hardcoded resolution (e.g. 1920x1080) here which we
-    // intentionally discard so the game fills the real display at whatever
-    // resolution the Xbox is currently running at.
     RefreshWindowMetrics(false);
     if (!CreateEglContext()) {
         ShimLog("CreateEglContext FAILED");
