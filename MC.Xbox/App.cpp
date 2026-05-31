@@ -1009,7 +1009,9 @@ static void CleanupDownloadedRuntimeFiles(const std::wstring& runtimeRoot, const
 static bool EnsureDownloadMarkerMatches(
     const std::wstring& manifestPath,
     const std::wstring& runtimeRoot,
-    bool forceRepair) {
+    bool forceRepair,
+    bool* outMarkerAlreadyMatched = nullptr) {
+    if (outMarkerAlreadyMatched) *outMarkerAlreadyMatched = false;
     if (forceRepair) {
         CleanupDownloadedRuntimeFiles(runtimeRoot, L"repair requested");
         return true;
@@ -1021,6 +1023,7 @@ static bool EnsureDownloadMarkerMatches(
         return true;
     }
     if (actual == expected) {
+        if (outMarkerAlreadyMatched) *outMarkerAlreadyMatched = true;
         return true;
     }
 
@@ -1253,8 +1256,15 @@ static bool EnsureRuntimeDownloads(
         WriteLogF(L"No download manifest found at %s", manifestPath.c_str());
         return false;
     }
-    if (!EnsureDownloadMarkerMatches(manifestPath, runtimeRoot, options.forceRepair)) {
+    bool markerAlreadyMatched = false;
+    if (!EnsureDownloadMarkerMatches(manifestPath, runtimeRoot, options.forceRepair, &markerAlreadyMatched)) {
         return false;
+    }
+
+    if (markerAlreadyMatched) {
+        WriteLog(L"Download marker matched; skipping file verification");
+        if (progress) progress(L"Files verified", L"Launching Minecraft", 1.0f);
+        return true;
     }
 
     std::vector<DownloadManifestEntry> entries;

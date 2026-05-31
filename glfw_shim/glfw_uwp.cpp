@@ -306,6 +306,7 @@ static double g_cached_scale_x = 1.0;
 static double g_cached_scale_y = 1.0;
 static bool g_scale_cached = false;
 static bool g_metrics_dirty = true;
+static bool g_framebuffer_from_egl = false;
 static volatile LONG g_swap_log_count = 0;
 static volatile LONG g_poll_log_count = 0;
 static volatile LONG g_proc_log_count = 0;
@@ -1025,8 +1026,12 @@ static void RefreshWindowMetrics(bool fireCallbacks) {
 
     const int newWindowWidth = bounds.Width > 0 ? (int)(bounds.Width + 0.5f) : g_window_width;
     const int newWindowHeight = bounds.Height > 0 ? (int)(bounds.Height + 0.5f) : g_window_height;
-    const int newFramebufferWidth = ScaleDimensionToPixels(bounds.Width, scaleX, g_framebuffer_width);
-    const int newFramebufferHeight = ScaleDimensionToPixels(bounds.Height, scaleY, g_framebuffer_height);
+    const int newFramebufferWidth = g_framebuffer_from_egl
+        ? g_framebuffer_width
+        : ScaleDimensionToPixels(bounds.Width, scaleX, g_framebuffer_width);
+    const int newFramebufferHeight = g_framebuffer_from_egl
+        ? g_framebuffer_height
+        : ScaleDimensionToPixels(bounds.Height, scaleY, g_framebuffer_height);
     const float newContentScaleX = (float)scaleX;
     const float newContentScaleY = (float)scaleY;
 
@@ -1357,6 +1362,7 @@ static bool CreateEglContext() {
             g_framebuffer_height = surfH;
             g_vidmode.width = surfW;
             g_vidmode.height = surfH;
+            g_framebuffer_from_egl = true;
         } else {
             ShimLog("eglQuerySurface failed, keeping framebuffer %dx%d",
                 g_framebuffer_width, g_framebuffer_height);
