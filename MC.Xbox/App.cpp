@@ -1041,6 +1041,168 @@ static void MarkDownloadManifestCurrent(const std::wstring& manifestPath, const 
 
 static constexpr int kDownloadFileAttempts = 5;
 static constexpr DWORD kDownloadRetryBaseDelayMs = 750;
+static constexpr unsigned kDownloadWorkerCount = 16;
+
+struct WinHttpConnection {
+    HINTERNET session = nullptr;
+    HINTERNET connect = nullptr;
+    std::wstring host;
+    INTERNET_PORT port = 0;
+    bool secure = false;
+
+    void Close() {
+        if (connect) { WinHttpCloseHandle(connect); connect = nullptr; }
+        if (session) { WinHttpCloseHandle(session); session = nullptr; }
+        host.clear();
+    }
+
+    ~WinHttpConnection() { Close(); }
+};
+
+static bool DownloadUrlToFileWithConn(
+    WinHttpConnection& conn,
+    const std::wstring& url,
+    const std::wstring& destination,
+    const std::function<void(unsigned long long)>& progressCallback) {
+    std::wstring currentUrl = url;
+
+    for (int redirect = 0; redirect < 6; ++redirect) {
+        URL_COMPONENTS uc = {};
+        uc.dwStructSize = sizeof(uc);
+        uc.dwSchemeLength = static_cast<DWORD>(-1);
+        uc.dwHostNameLength = static_cast<DWORD>(-1);
+        uc.dwUrlPathLength = static_cast<DWORD>(-1);
+        uc.dwExtraInfoLength = static_cast<DWORD>(-1);
+
+        std::wstring mutableUrl = currentUrl;
+        if (!WinHttpCrackUrl(mutableUrl.c_str(), 0, 0, &uc)) {
+            WriteLogF(L"WinHttpCrackUrl failed err=%u url=%s", GetLastError(), currentUrl.c_str());
+            return false;
+        }
+
+        std::wstring newHost(uc.lpszHostName, uc.dwHostNameLength);
+        INTERNET_PORT newPort = uc.nPort;
+        bool newSecure = uc.nScheme == INTERNET_SCHEME_HTTPS;
+
+        if (!conn.session) {
+            conn.session = WinHttpOpen(
+                L"MinecraftJavaUWP/1.0",
+                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                WINHTTP_NO_PROXY_NAME,
+                WINHTTP_NO_PROXY_BYPASS,
+                0);
+            if (!conn.session) {
+                WriteLogF(L"WinHttpOpen failed err=%u", GetLastError());
+                return false;
+            }
+            WinHttpSetTimeouts(conn.session, 15000, 15000, 30000, 30000);
+        }
+
+        if (!conn.connect || conn.host != newHost || conn.port != newPort || conn.secure != newSecure) {
+            if (conn.connect) { WinHttpCloseHandle(conn.connect); conn.connect = nullptr; }
+            conn.connect = WinHttpConnect(conn.session, newHost.c_str(), newPort, 0);
+            if (!conn.connect) {
+                WriteLogF(L"WinHttpConnect failed err=%u host=%s", GetLastError(), newHost.c_str());
+                return false;
+            }
+            conn.host = newHost;
+            conn.port = newPort;
+            conn.secure = newSecure;
+        }
+
+        std::wstring objectName;
+        if (uc.dwUrlPathLength > 0) objectName.assign(uc.lpszUrlPath, uc.dwUrlPathLength);
+        if (uc.dwExtraInfoLength > 0) objectName.append(uc.lpszExtraInfo, uc.dwExtraInfoLength);
+        if (objectName.empty()) objectName = L"/";
+
+        const DWORD reqFlags = newSecure ? WINHTTP_FLAG_SECURE : 0;
+        HINTERNET request = WinHttpOpenRequest(
+            conn.connect, L"GET", objectName.c_str(),
+            nullptr, WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES, reqFlags);
+        if (!request) {
+            WriteLogF(L"WinHttpOpenRequest failed err=%u", GetLastError());
+            conn.Close();
+            return false;
+        }
+
+        BOOL sent = WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+        BOOL received = sent ? WinHttpReceiveResponse(request, nullptr) : FALSE;
+        if (!sent || !received) {
+            WriteLogF(L"WinHttp request failed err=%u url=%s", GetLastError(), currentUrl.c_str());
+            WinHttpCloseHandle(request);
+            conn.Close();
+            return false;
+        }
+
+        DWORD status = 0;
+        DWORD statusSize = sizeof(status);
+        if (!WinHttpQueryHeaders(request,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize,
+            WINHTTP_NO_HEADER_INDEX)) {
+            WinHttpCloseHandle(request);
+            conn.Close();
+            return false;
+        }
+
+        if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
+            DWORD locationBytes = 0;
+            WinHttpQueryHeaders(request, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX,
+                WINHTTP_NO_OUTPUT_BUFFER, &locationBytes, WINHTTP_NO_HEADER_INDEX);
+            std::vector<wchar_t> location((locationBytes / sizeof(wchar_t)) + 1);
+            if (locationBytes > 0 && WinHttpQueryHeaders(request, WINHTTP_QUERY_LOCATION,
+                WINHTTP_HEADER_NAME_BY_INDEX, location.data(), &locationBytes,
+                WINHTTP_NO_HEADER_INDEX)) {
+                currentUrl = BuildRedirectUrl(currentUrl, location.data());
+                WinHttpCloseHandle(request);
+                continue;
+            }
+        }
+
+        if (status != 200) {
+            WriteLogF(L"Download failed HTTP %u url=%s", status, currentUrl.c_str());
+            WinHttpCloseHandle(request);
+            conn.Close();
+            return false;
+        }
+
+        EnsureDirectoryTree(GetParentDir(destination));
+        FILE* out = nullptr;
+        if (_wfopen_s(&out, destination.c_str(), L"wb") != 0 || !out) {
+            WinHttpCloseHandle(request);
+            return false;
+        }
+
+        bool ok = true;
+        unsigned long long fileBytesRead = 0;
+        unsigned char buffer[256 * 1024];
+        for (;;) {
+            DWORD bytesRead = 0;
+            if (!WinHttpReadData(request, buffer, sizeof(buffer), &bytesRead)) {
+                WriteLogF(L"WinHttpReadData failed err=%u", GetLastError());
+                ok = false;
+                break;
+            }
+            if (bytesRead == 0) break;
+            if (fwrite(buffer, 1, bytesRead, out) != bytesRead) {
+                ok = false;
+                break;
+            }
+            fileBytesRead += bytesRead;
+            if (progressCallback) progressCallback(fileBytesRead);
+        }
+
+        fclose(out);
+        WinHttpCloseHandle(request);
+        if (!ok) conn.Close();
+        return ok;
+    }
+
+    WriteLogF(L"Too many redirects url=%s", url.c_str());
+    return false;
+}
 
 static std::wstring BuildRedirectUrl(const std::wstring& currentUrl, const std::wstring& location) {
     if (location.find(L"://") != std::wstring::npos) {
@@ -1328,7 +1490,7 @@ static bool EnsureRuntimeDownloads(
         return true;
     }
 
-    const unsigned workerCount = (std::max)(1u, (std::min)(8u, options.workerCount));
+    const unsigned workerCount = (std::max)(1u, (std::min)(kDownloadWorkerCount, options.workerCount));
     const unsigned workersToStart = (std::min<unsigned>)(workerCount, static_cast<unsigned>(missing.size()));
     WriteLogF(L"Downloading missing runtime files missing=%zu workers=%u", missing.size(), workersToStart);
 
@@ -1341,6 +1503,7 @@ static bool EnsureRuntimeDownloads(
     int activeWorkers = static_cast<int>(workersToStart);
 
     auto workerProc = [&]() {
+        WinHttpConnection threadConn;
         for (;;) {
             size_t entryIndex = 0;
             {
@@ -1390,7 +1553,7 @@ static bool EnsureRuntimeDownloads(
                     std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
                 }
 
-                if (DownloadUrlToFile(entry.url, tempPath, progressCallback)) {
+                if (DownloadUrlToFileWithConn(threadConn, entry.url, tempPath, progressCallback)) {
                     downloadedOk = true;
                     break;
                 }
@@ -5261,7 +5424,7 @@ public:
                 ++downloadAttempt;
                 DownloadOptions downloadOptions;
                 downloadOptions.forceRepair = repairDownloads && downloadAttempt == 1;
-                downloadOptions.workerCount = 6;
+                downloadOptions.workerCount = kDownloadWorkerCount;
 
                 if (EnsureRuntimeDownloads(
                     manifestPath,
